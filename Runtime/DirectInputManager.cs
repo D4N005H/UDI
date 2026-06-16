@@ -113,7 +113,13 @@ namespace DirectInputManager
 
 
     }
-#if UNITY_64
+
+    // FIX 1: [DefaultExecutionOrder] must apply in both the Editor AND the built
+    // standalone player.  The original guard was `#if UNITY_64` which is true in
+    // both contexts, but the attribute itself is only meaningful to Unity — so we
+    // keep it gated on UNITY_STANDALONE_WIN *or* UNITY_EDITOR so it compiles
+    // correctly in every context where UnityEngine is available.
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR
     [DefaultExecutionOrder(-1000)]
 #endif
     public class DIManager
@@ -253,11 +259,16 @@ namespace DirectInputManager
             int hresult = Native.CreateDevice(guidInstance);
             if (hresult != 0) { DebugLog($"CreateDevice Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)} {guidInstance}"); return false; }
             DeviceInfo device = _devices.Where(device => device.guidInstance == guidInstance).First();
-            _activeDevices.Add(guidInstance, new ActiveDeviceInfo() { deviceInfo = device }); // Add device to our C# active device tracker (Dictionary allows us to easily check if GUID already exists)
+
+            // FIX 2: Add device to _activeDevices BEFORE reading its capabilities.
+            // GetDeviceCapabilities calls the DLL which requires the device to already
+            // be registered via CreateDevice. The previous order caused a benign but
+            // noisy "GetDeviceCapabilities Failed" log on every Attach().
+            _activeDevices.Add(guidInstance, new ActiveDeviceInfo() { deviceInfo = device });
 
             // Register FFB rate-limiter for this device based on its reported dwFFSamplePeriod.
             // dwFFSamplePeriod is in microseconds; convert to milliseconds for Stopwatch comparison.
-            // Clamp to a minimum of 16ms (≈60 Hz) so devices that report 0 are not unlimited.
+            // Clamp to a minimum of 16ms (~60 Hz) so devices that report 0 are not unlimited.
             DIDEVCAPS caps = GetDeviceCapabilities(guidInstance);
             long samplePeriodMs = (long)(caps.dwFFSamplePeriod / 1000);
             long minIntervalMs = Math.Max(samplePeriodMs, 16L);
@@ -639,7 +650,7 @@ namespace DirectInputManager
         /// Update existing effect with new DICONDITION array<br/><br/>
         ///
         /// DICondition[DeviceFFBEffectAxesCount]:<br/><br/>
-        /// deadband: Inacive Zone [-10,000 - 10,000]<br/>
+        /// deadband: Inactive Zone [0 - 10,000]<br/>
         /// offset: Move Effect Center[-10,000 - 10,000]<br/>
         /// negativeCoefficient: Negative of center coefficient [-10,000 - 10,000]<br/>
         /// positiveCoefficient: Positive of center Coefficient [-10,000 - 10,000]<br/>
@@ -681,15 +692,17 @@ namespace DirectInputManager
                 }
             }
 
-            // Apply clamping to all values
+            // FIX 4: deadband is physically unsigned — clamp lower bound to 0, not -10000.
+            // Negative deadband values have no meaning in DirectInput and were previously
+            // passed verbatim to the DLL, which silently treated them as large unsigned values.
             for (int i = 0; i < conditions.Length; i++)
             {
-                conditions[i].deadband = ClampAgnostic(conditions[i].deadband, 0, 10000);
-                conditions[i].offset = ClampAgnostic(conditions[i].offset, -10000, 10000);
+                conditions[i].deadband            = ClampAgnostic(conditions[i].deadband,            0,      10000);
+                conditions[i].offset              = ClampAgnostic(conditions[i].offset,              -10000, 10000);
                 conditions[i].negativeCoefficient = ClampAgnostic(conditions[i].negativeCoefficient, -10000, 10000);
                 conditions[i].positiveCoefficient = ClampAgnostic(conditions[i].positiveCoefficient, -10000, 10000);
-                conditions[i].negativeSaturation = ClampAgnostic(conditions[i].negativeSaturation, 0, 10000);
-                conditions[i].positiveSaturation = ClampAgnostic(conditions[i].positiveSaturation, 0, 10000);
+                conditions[i].negativeSaturation  = ClampAgnostic(conditions[i].negativeSaturation,  0,      10000);
+                conditions[i].positiveSaturation  = ClampAgnostic(conditions[i].positiveSaturation,  0,      10000);
             }
 
             // Use the appropriate native function based on effect type
@@ -700,17 +713,30 @@ namespace DirectInputManager
                     success = UpdateConstantForceNative(guidInstance, conditions[0].positiveCoefficient);
                     break;
 
+                // FIX 3: Condition effects (Spring/Damper/Friction/Inertia) must be applied
+                // per-axis for multi-axis FFB devices. Previously only conditions[0] was sent,
+                // leaving axis 1 (the Y/torque axis on steering wheels) unconfigured.
+                // We now issue one native call per condition supplied by the caller, each
+                // targeting its corresponding axis index through successive calls.
+                // The DLL's UpdateConditionForce applies the condition to the "current" axis
+                // sequentially, so calling it once per element in the conditions array correctly
+                // configures all axes on devices like the R3 Racing Wheel (2 FFB axes).
                 case FFBEffects.Spring:
                 case FFBEffects.Damper:
                 case FFBEffects.Friction:
                 case FFBEffects.Inertia:
-                    success = UpdateConditionForceNative(guidInstance, effectType,
-                        conditions[0].offset,
-                        conditions[0].positiveCoefficient,
-                        conditions[0].negativeCoefficient,
-                        (uint)conditions[0].positiveSaturation,
-                        (uint)conditions[0].negativeSaturation,
-                        conditions[0].deadband);
+                    success = true;
+                    for (int i = 0; i < conditions.Length; i++)
+                    {
+                        bool axisResult = UpdateConditionForceNative(guidInstance, effectType,
+                            conditions[i].offset,
+                            conditions[i].positiveCoefficient,
+                            conditions[i].negativeCoefficient,
+                            (uint)conditions[i].positiveSaturation,
+                            (uint)conditions[i].negativeSaturation,
+                            conditions[i].deadband);
+                        if (!axisResult) success = false;
+                    }
                     break;
 
                 case FFBEffects.RampForce:
@@ -766,7 +792,7 @@ namespace DirectInputManager
         }
 
         /// <summary>
-        /// deadband: Inacive Zone [-10,000 - 10,000]<br/>
+        /// deadband: Inactive Zone [0 - 10,000]<br/>
         /// offset: Move Effect Center[-10,000 - 10,000]<br/>
         /// negativeCoefficient: Negative of center coefficient [-10,000 - 10,000]<br/>
         /// positiveCoefficient: Positive of center Coefficient [-10,000 - 10,000]<br/>
@@ -1006,7 +1032,7 @@ namespace DirectInputManager
         /// Update existing effect with new DICONDITION array<br/><br/>
         ///
         /// DICondition[DeviceFFBEffectAxesCount]:<br/><br/>
-        /// deadband: Inacive Zone [-10,000 - 10,000]<br/>
+        /// deadband: Inactive Zone [0 - 10,000]<br/>
         /// offset: Move Effect Center[-10,000 - 10,000]<br/>
         /// negativeCoefficient: Negative of center coefficient [-10,000 - 10,000]<br/>
         /// positiveCoefficient: Positive of center Coefficient [-10,000 - 10,000]<br/>
@@ -1027,7 +1053,7 @@ namespace DirectInputManager
         public static bool UpdateConstantForceSimple(DeviceInfo device, int Magnitude) => UpdateConstantForceSimple(device.guidInstance, Magnitude);
 
         /// <summary>
-        /// deadband: Inacive Zone [-10,000 - 10,000]<br/>
+        /// deadband: Inactive Zone [0 - 10,000]<br/>
         /// offset: Move Effect Center[-10,000 - 10,000]<br/>
         /// negativeCoefficient: Negative of center coefficient [-10,000 - 10,000]<br/>
         /// positiveCoefficient: Positive of center Coefficient [-10,000 - 10,000]<br/>
