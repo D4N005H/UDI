@@ -48,7 +48,7 @@ int main() {
 	// Default effect direction per actuator count.
 	long one[1] = { 123 };
 	FillDefaultDirection(one, 1, 10000L);
-	CHECK(one[0] == 0);
+	CHECK(one[0] == 10000);
 	long two[2] = { 1, 1 };
 	FillDefaultDirection(two, 2, 10000L);
 	CHECK(two[0] == 10000 && two[1] == 0);

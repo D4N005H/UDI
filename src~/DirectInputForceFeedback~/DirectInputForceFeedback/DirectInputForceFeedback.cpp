@@ -849,8 +849,8 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateFFBEffect(LPCSTR guidInstance, Effect
 		for (int idx = 0; idx < FFBAxesCount; idx++) {
 			FFBAxes[idx] = AxisTypeToDIJOFS(_DeviceFFBAxes[GUIDString][idx].guidType);
 		}
-		// One actuator: direction element 0. Several: unit vector along the first actuator. The previous
-		// (10000, 10000) vector was a 45 degree diagonal that split the magnitude between two actuators.
+		// Unit vector along the first actuator (see DirectInputHelpers.h). The previous (10000, 10000)
+		// vector was a 45 degree diagonal that split the magnitude between two actuators.
 		diffb::FillDefaultDirection(FFBDirections, FFBAxesCount, static_cast<LONG>(DI_FFNOMINALMAX));
 		DICONSTANTFORCE* constantForce = nullptr;
 		DICONDITION* conditions = nullptr;
@@ -1162,8 +1162,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConstantForce(LPCSTR guidI
 			LogMessage("UpdateConstantForce: Failed to update effect parameters: 0x%08X", hr);
 			return hr;
 		}
-		LogMessage("UpdateConstantForce: Magnitude set to %d", clamped);
-		return S_OK;
+		return S_OK; // no per-call log: this runs once per effect per frame
 	}
 	catch (const std::exception& e) {
 		LogMessage("UpdateConstantForce: Exception: %s", e.what());
@@ -1230,7 +1229,6 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdatePeriodicForce(LPCSTR guidI
 			LogMessage("UpdatePeriodicForce: Failed to update effect parameters: 0x%08X", hr);
 			return hr;
 		}
-		LogMessage("UpdatePeriodicForce: Magnitude=%d, Offset=%d, Period=%d", clampedMagnitude, clampedOffset, period);
 		return S_OK;
 	}
 	catch (const std::exception& e) {
@@ -1289,7 +1287,6 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateRampForce(LPCSTR guidInsta
 			LogMessage("UpdateRampForce: Failed to update effect parameters: 0x%08X", hr);
 			return hr;
 		}
-		LogMessage("UpdateRampForce: Start=%d, End=%d", clampedStart, clampedEnd);
 		return S_OK;
 	}
 	catch (const std::exception& e) {
@@ -1368,8 +1365,6 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConditionForce(LPCSTR guid
 			LogMessage("UpdateConditionForce: Failed to update effect parameters: 0x%08X", hr);
 			return hr;
 		}
-		LogMessage("UpdateConditionForce: Effect updated with PosCoef=%d, NegCoef=%d across %d axes",
-			clampedPosCoef, clampedNegCoef, axisCount);
 		return S_OK;
 	}
 	catch (const std::exception& e) {
@@ -1437,7 +1432,6 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateCustomForce(LPCSTR guidIns
 			LogMessage("UpdateCustomForce: Failed to update effect parameters: 0x%08X", hr);
 			return hr;
 		}
-		LogMessage("UpdateCustomForce: Updated with %d samples, period %d", sampleCount, samplePeriod);
 		return S_OK;
 	}
 	catch (const std::exception& e) {

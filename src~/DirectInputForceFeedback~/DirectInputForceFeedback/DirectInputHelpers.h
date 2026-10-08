@@ -40,13 +40,15 @@ inline uint16_t PovToDpadBits(uint32_t pov) {
 	return bits;
 }
 
-// Default DIEFF_CARTESIAN direction for an effect spanning `count` actuators.
-// One actuator: a single element holding 0 (DirectInput "Effect Direction" sample, SDL steering axis).
-// Several actuators: a unit vector along the first one, so the whole magnitude reaches it.
+// Default DIEFF_CARTESIAN direction for an effect spanning `count` actuators: a unit vector along the
+// first actuator, so the whole magnitude reaches it and the sign of the magnitude selects the side.
+// Microsoft's single-axis sample uses 0 here and DirectInput ignores the value for one axis; a non-zero
+// first element is kept because commit 8a4e3d7 reports a wheel that misread 0 (unverified), and it is
+// equally valid. The previous "10000 on every element" was a 45 degree diagonal on two actuators.
 template <typename T>
 inline void FillDefaultDirection(T* out, int count, T nominalMax) {
 	for (int i = 0; i < count; i++) {
-		out[i] = (count > 1 && i == 0) ? nominalMax : static_cast<T>(0);
+		out[i] = (i == 0) ? nominalMax : static_cast<T>(0);
 	}
 }
 
