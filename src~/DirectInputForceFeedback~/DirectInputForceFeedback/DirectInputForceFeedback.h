@@ -19,9 +19,10 @@
 #define UNITY_INTERFACE_EXPORT __declspec(dllexport)
 #endif
 
-// Custom error codes
-#define DIERR_NOWINDOWHANDLE      0x8007000DL  // No valid window handle available
-#define DIERR_UNITYNOTINITIALIZED 0x8007000EL  // Unity not initialized
+// Custom error codes (FACILITY_ITF, outside the 0x800402xx block DirectInput uses). The previous values
+// 0x8007000D / 0x8007000E were the Win32 HRESULTs for ERROR_INVALID_DATA and E_OUTOFMEMORY (= DIERR_OUTOFMEMORY).
+#define DIERR_NOWINDOWHANDLE      0x8004F300L  // The DLL could not create its hidden window
+#define DIERR_UNITYNOTINITIALIZED 0x8004F301L  // UnityPluginLoad / InitializeForStandalone has not run
 
 // Define constants for string buffer sizes
 #define MAX_GUID_STRING_LENGTH 39  // {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX} + null
@@ -122,6 +123,8 @@ extern "C" { // Everything to be made available by the DLL
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT SetAutocenter(LPCSTR guidInstance, bool AutocenterState);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateFFBEffect(LPCSTR guidInstance, Effects::Type effectType);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effects::Type effectType);
+	// *status receives the IDirectInputEffect::GetEffectStatus flags (DIEGES_PLAYING = 1). E_ABORT when the effect was never created.
+	DIRECTINPUTFORCEFEEDBACK_API HRESULT GetFFBEffectStatus(LPCSTR guidInstance, Effects::Type effectType, /*[out]*/ DWORD* status);
 
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConstantForce(LPCSTR guidInstance, int magnitude);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdatePeriodicForce(LPCSTR guidInstance, Effects::Type effectType, int magnitude, DWORD period, int offset);
@@ -163,7 +166,6 @@ BOOL CALLBACK _EnumDevicesCallback(const DIDEVICEINSTANCE* pInst, void* pContext
 BOOL CALLBACK _EnumDevicesCallbackFFB(const DIDEVICEINSTANCE* DIDI, void* pContext);
 BOOL CALLBACK _EnumFFBEffectsCallback(LPCDIEFFECTINFO pdei, LPVOID pvRef);
 BOOL CALLBACK _EnumFFBAxisCallback(const DIDEVICEOBJECTINSTANCE* pdidoi, LPVOID pvRef);
-LRESULT _WindowsHookCallback(int code, WPARAM wParam, LPARAM lParam);
 
 //////////////////////////////////////////////////////////////
 // Helper Functions

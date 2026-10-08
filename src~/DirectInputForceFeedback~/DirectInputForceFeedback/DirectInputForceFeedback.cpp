@@ -3,7 +3,9 @@
 #include <limits>
 #include <cstdlib>
 #include "DirectInputForceFeedback.h"
+#include "DirectInputHelpers.h"
 #include <strsafe.h>
+#include <dbt.h>
 LPDIRECTINPUT8 _DirectInput = nullptr;
 bool g_UnityInitialized = false;
 std::string g_LastErrorMessage;
@@ -40,22 +42,7 @@ void SafeStrFree(char* str) {
 	}
 }
 bool IsValidGUIDString(LPCSTR guidString) {
-	if (!guidString) return false;
-	size_t len = strlen(guidString);
-	if (len < 36) return false;
-	if (len == 38) {
-		if (guidString[0] != '{' || guidString[37] != '}') return false;
-		if (guidString[9] != '-' || guidString[14] != '-' ||
-			guidString[19] != '-' || guidString[24] != '-') return false;
-	}
-	else if (len == 36) {
-		if (guidString[8] != '-' || guidString[13] != '-' ||
-			guidString[18] != '-' || guidString[23] != '-') return false;
-	}
-	else {
-		return false;
-	}
-	return true;
+	return diffb::IsValidGuidString(guidString);
 }
 extern "C" DIRECTINPUTFORCEFEEDBACK_API void UNITY_INTERFACE_API UnityPluginLoad(void* unityInterfaces) {
 	g_UnityInitialized = true;
@@ -85,6 +72,82 @@ void LogMessage(const char* format, ...) {
 void SetLastErrorMessage(const char* message) {
 	g_LastErrorMessage = message;
 }
+//////////////////////////////////////////////////////////////
+// Hidden window owned by this DLL.
+// SetCooperativeLevel needs a top-level window that belongs to the calling process and that outlives the
+// acquisition, and WM_DEVICECHANGE is delivered to a window procedure. One owned window serves both
+// (SDL's helper window follows the same pattern). It is created on the thread that first needs it, and
+// that thread's message loop (Unity's or the WinForms one) dispatches its messages.
+//////////////////////////////////////////////////////////////
+static HWND g_hiddenWindow = nullptr;
+static HDEVNOTIFY g_deviceNotification = nullptr;
+static DWORD g_hiddenWindowThread = 0;
+static const wchar_t* const kHiddenWindowClass = L"DirectInputForceFeedback.HiddenWindow";
+static const GUID kGuidDevInterfaceHid = { 0x4D1E55B2, 0xF16F, 0x11CF, { 0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 } };
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+static HINSTANCE ThisModule() { return reinterpret_cast<HINSTANCE>(&__ImageBase); }
+
+static LRESULT CALLBACK HiddenWindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+	if (message == WM_DEVICECHANGE) {
+		if (wParam == DBT_DEVNODES_CHANGED || wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) {
+			LogMessage("HiddenWindowProc: WM_DEVICECHANGE 0x%04X", static_cast<unsigned>(wParam));
+			if (g_deviceCallback) {
+				g_deviceCallback(static_cast<DBTEvents>(wParam));
+			}
+		}
+		return TRUE;
+	}
+	return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+static HWND EnsureHiddenWindow() {
+	if (g_hiddenWindow) return g_hiddenWindow;
+	WNDCLASSEXW wc = {};
+	wc.cbSize = sizeof(wc);
+	wc.lpfnWndProc = HiddenWindowProc;
+	wc.hInstance = ThisModule();
+	wc.lpszClassName = kHiddenWindowClass;
+	if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+		LogMessage("EnsureHiddenWindow: RegisterClassExW failed: %lu", GetLastError());
+		return nullptr;
+	}
+	g_hiddenWindow = CreateWindowExW(0, kHiddenWindowClass, L"DirectInputForceFeedback", WS_OVERLAPPED,
+		0, 0, 0, 0, nullptr, nullptr, ThisModule(), nullptr);
+	if (!g_hiddenWindow) {
+		LogMessage("EnsureHiddenWindow: CreateWindowExW failed: %lu", GetLastError());
+		return nullptr;
+	}
+	g_hiddenWindowThread = GetCurrentThreadId();
+	// DBT_DEVNODES_CHANGED is broadcast to every top-level window; registering for the HID interface class
+	// adds DBT_DEVICEARRIVAL / DBT_DEVICEREMOVECOMPLETE for the devices DirectInput enumerates.
+	DEV_BROADCAST_DEVICEINTERFACE_W filter = {};
+	filter.dbcc_size = sizeof(filter);
+	filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+	filter.dbcc_classguid = kGuidDevInterfaceHid;
+	g_deviceNotification = RegisterDeviceNotificationW(g_hiddenWindow, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+	if (!g_deviceNotification) {
+		LogMessage("EnsureHiddenWindow: RegisterDeviceNotificationW failed: %lu (DBT_DEVNODES_CHANGED broadcasts still arrive)", GetLastError());
+	}
+	LogMessage("EnsureHiddenWindow: hidden window created on thread %lu", g_hiddenWindowThread);
+	return g_hiddenWindow;
+}
+
+static void DestroyHiddenWindow() {
+	if (g_deviceNotification) {
+		UnregisterDeviceNotification(g_deviceNotification);
+		g_deviceNotification = nullptr;
+	}
+	if (g_hiddenWindow) {
+		// shortcut: DestroyWindow only works on the creating thread; a StopDirectInput from another thread
+		// leaves the window until process exit, upgrade to a dedicated notification thread if a host needs that.
+		if (!DestroyWindow(g_hiddenWindow)) {
+			LogMessage("DestroyHiddenWindow: DestroyWindow failed: %lu (created on thread %lu, called from %lu)",
+				GetLastError(), g_hiddenWindowThread, GetCurrentThreadId());
+		}
+		g_hiddenWindow = nullptr;
+		UnregisterClassW(kHiddenWindowClass, ThisModule());
+	}
+}
 static HRESULT ReacquireDeviceAndEffects(const std::string& GUIDString) {
 	if (!_ActiveDevices.contains(GUIDString)) {
 		return E_FAIL;
@@ -97,7 +160,11 @@ static HRESULT ReacquireDeviceAndEffects(const std::string& GUIDString) {
 	if (_DeviceFFBEffectControl.contains(GUIDString)) {
 		for (auto& [effectType, effectControl] : _DeviceFFBEffectControl[GUIDString]) {
 			if (effectControl) {
-				effectControl->Start(1, 0);
+				// Effects are unloaded when acquisition is lost; Start downloads and restarts them.
+				HRESULT hrStart = effectControl->Start(1, 0);
+				if (FAILED(hrStart)) {
+					LogMessage("ReacquireDeviceAndEffects: Failed to restart effect %d: 0x%08X", static_cast<int>(effectType), hrStart);
+				}
 			}
 		}
 	}
@@ -155,6 +222,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT StopDirectInput() {
 	_DeviceFFBAxes.clear();
 	_DeviceFFBEffectConfig.clear();
 	_DeviceFFBEffectControl.clear();
+	DestroyHiddenWindow(); // after every device released: the window must outlive the acquisitions
 	if (_DirectInput) {
 		_DirectInput->Release();
 		_DirectInput = nullptr;
@@ -263,16 +331,14 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateDevice(LPCSTR guidInstance) {
 			SetLastErrorMessage("Failed to set data format");
 			return hr;
 		}
-		HWND hWnd = GetForegroundWindow();
+		// The cooperative-level window must be a top-level window of this process (the foreground window
+		// can belong to another process) and must stay alive while the device is acquired.
+		HWND hWnd = EnsureHiddenWindow();
 		if (!hWnd) {
-			LogMessage("CreateDevice: No foreground window, using desktop window");
-			hWnd = GetDesktopWindow();
-			if (!hWnd) {
-				LogMessage("CreateDevice: Failed to get any window handle");
-				DIDevice->Release();
-				SetLastErrorMessage("Failed to get window handle");
-				return DIERR_NOWINDOWHANDLE;
-			}
+			LogMessage("CreateDevice: Failed to create the hidden window");
+			DIDevice->Release();
+			SetLastErrorMessage("Failed to create window handle");
+			return DIERR_NOWINDOWHANDLE;
 		}
 		hr = DIDevice->SetCooperativeLevel(hWnd, DISCL_EXCLUSIVE | DISCL_BACKGROUND);
 		if (FAILED(hr)) {
@@ -371,7 +437,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceState(LPCSTR guidInstance, FlatJoy
 		HRESULT hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &DeviceStateRaw);
 		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
 			LogMessage("GetDeviceState: Device input lost, reacquiring");
-			hr = _ActiveDevices[GUIDString]->Acquire();
+			hr = ReacquireDeviceAndEffects(GUIDString); // restarts the effects the loss unloaded
 			if (FAILED(hr)) {
 				LogMessage("GetDeviceState: Failed to reacquire device: 0x%08X", hr);
 				SetLastErrorMessage("Failed to reacquire device");
@@ -419,7 +485,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceStateRaw(LPCSTR guidInstance, DIJO
 		HRESULT hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &deviceState);
 		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
 			LogMessage("GetDeviceStateRaw: Device input lost, reacquiring");
-			hr = _ActiveDevices[GUIDString]->Acquire();
+			hr = ReacquireDeviceAndEffects(GUIDString); // restarts the effects the loss unloaded
 			if (FAILED(hr)) {
 				LogMessage("GetDeviceStateRaw: Failed to reacquire device: 0x%08X", hr);
 				SetLastErrorMessage("Failed to reacquire device");
@@ -502,10 +568,18 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT SetAutocenter(LPCSTR guidInstance, bool Aut
 		DIPropAutoCenter.diph.dwObj = 0;
 		DIPropAutoCenter.diph.dwHow = DIPH_DEVICE;
 		DIPropAutoCenter.dwData = AutocenterState ? DIPROPAUTOCENTER_ON : DIPROPAUTOCENTER_OFF;
-		HRESULT hr = _ActiveDevices[GUIDString]->SetProperty(DIPROP_AUTOCENTER, &DIPropAutoCenter.diph);
+		// Properties other than FF gain can only be changed while the device is not acquired.
+		LPDIRECTINPUTDEVICE8 device = _ActiveDevices[GUIDString];
+		device->Unacquire();
+		HRESULT hr = device->SetProperty(DIPROP_AUTOCENTER, &DIPropAutoCenter.diph);
+		HRESULT hrReacquire = ReacquireDeviceAndEffects(GUIDString);
 		if (FAILED(hr)) {
 			LogMessage("SetAutocenter: Failed to set autocenter: 0x%08X", hr);
 			return hr;
+		}
+		if (FAILED(hrReacquire)) {
+			LogMessage("SetAutocenter: Autocenter set but reacquire failed: 0x%08X", hrReacquire);
+			return hrReacquire;
 		}
 		LogMessage("SetAutocenter: Autocenter set to %s", AutocenterState ? "ON" : "OFF");
 		return S_OK;
@@ -774,8 +848,10 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateFFBEffect(LPCSTR guidInstance, Effect
 		LONG* FFBDirections = new LONG[FFBAxesCount];
 		for (int idx = 0; idx < FFBAxesCount; idx++) {
 			FFBAxes[idx] = AxisTypeToDIJOFS(_DeviceFFBAxes[GUIDString][idx].guidType);
-			FFBDirections[idx] = DI_FFNOMINALMAX;
 		}
+		// One actuator: direction element 0. Several: unit vector along the first actuator. The previous
+		// (10000, 10000) vector was a 45 degree diagonal that split the magnitude between two actuators.
+		diffb::FillDefaultDirection(FFBDirections, FFBAxesCount, static_cast<LONG>(DI_FFNOMINALMAX));
 		DICONSTANTFORCE* constantForce = nullptr;
 		DICONDITION* conditions = nullptr;
 		DIRAMPFORCE* rampForce = nullptr;
@@ -1014,6 +1090,30 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effec
 	}
 	catch (...) {
 		LogMessage("DestroyFFBEffect: Unknown exception");
+		return E_FAIL;
+	}
+}
+extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT GetFFBEffectStatus(LPCSTR guidInstance, Effects::Type effectType, DWORD* status) {
+	try {
+		if (!status) {
+			return E_POINTER;
+		}
+		*status = 0;
+		if (!guidInstance || !IsValidGUIDString(guidInstance)) {
+			return E_INVALIDARG;
+		}
+		std::string GUIDString(guidInstance);
+		if (!_ActiveDevices.contains(GUIDString)) {
+			return E_FAIL;
+		}
+		auto deviceEffects = _DeviceFFBEffectControl.find(GUIDString);
+		if (deviceEffects == _DeviceFFBEffectControl.end() || !deviceEffects->second.contains(effectType) || !deviceEffects->second[effectType]) {
+			return E_ABORT; // effect was never created, same code the Update functions use
+		}
+		return deviceEffects->second[effectType]->GetEffectStatus(status); // DIEGES_PLAYING (1) while playing
+	}
+	catch (...) {
+		LogMessage("GetFFBEffectStatus: Unknown exception");
 		return E_FAIL;
 	}
 }
@@ -1392,7 +1492,10 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT StopAllFFBEffects(LPCSTR guidInstance) {
 }
 DIRECTINPUTFORCEFEEDBACK_API void SetDeviceChangeCallback(DeviceChangeCallback CB) {
 	g_deviceCallback = CB;
-	LogMessage("SetDeviceChangeCallback: Callback set");
+	if (CB) {
+		EnsureHiddenWindow(); // notifications must flow before any device is attached
+	}
+	LogMessage("SetDeviceChangeCallback: Callback %s", CB ? "set" : "cleared");
 }
 DIRECTINPUTFORCEFEEDBACK_API bool IsUnityInitialized() {
 	return g_UnityInitialized;
@@ -1531,36 +1634,12 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DEBUG1(LPCSTR guidInstance, SAFEARRAY** Deb
 				else {
 					debugInfo.push_back(L"    ERROR: Invalid constant force parameters");
 				}
-				debugInfo.push_back(L"Testing Constant Force Modification:");
-				try {
-					LONG originalMagnitude = 0;
-					if (cf) originalMagnitude = cf->lMagnitude;
-					LONG testMagnitude = DI_FFNOMINALMAX / 2;
-					debugInfo.push_back(L"  - Setting magnitude to 50%: " + std::to_wstring(testMagnitude));
-					if (cf) {
-						cf->lMagnitude = testMagnitude;
-						hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::ConstantForce]->SetParameters(
-							&effectConfig, DIEP_TYPESPECIFICPARAMS);
-						if (SUCCEEDED(hr)) {
-							debugInfo.push_back(L"  - Successfully applied 50% force");
-						}
-						else {
-							debugInfo.push_back(L"  - Failed to apply 50% force - 0x" + std::to_wstring(hr));
-						}
-						cf->lMagnitude = originalMagnitude;
-						hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::ConstantForce]->SetParameters(
-							&effectConfig, DIEP_TYPESPECIFICPARAMS);
-						if (SUCCEEDED(hr)) {
-							debugInfo.push_back(L"  - Successfully restored original force");
-						}
-						else {
-							debugInfo.push_back(L"  - Failed to restore original force - 0x" + std::to_wstring(hr));
-						}
-					}
-				}
-				catch (...) {
-					debugInfo.push_back(L"  - Exception occurred during force modification test");
-				}
+				// This report never changes a force: it used to push 50 percent constant force here without asking.
+				DWORD effectStatus = 0;
+				hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::ConstantForce]->GetEffectStatus(&effectStatus);
+				debugInfo.push_back(L"    - Status: " + (SUCCEEDED(hr)
+					? std::wstring((effectStatus & DIEGES_PLAYING) ? L"playing" : L"not playing")
+					: L"unknown (0x" + std::to_wstring(hr) + L")"));
 			}
 			else {
 				debugInfo.push_back(L"  - Constant Force effect is not active");
@@ -1703,7 +1782,7 @@ BOOL CALLBACK _EnumFFBEffectsCallback(LPCDIEFFECTINFO EffectInfo, LPVOID pvRef) 
 BOOL CALLBACK _EnumFFBAxisCallback(const DIDEVICEOBJECTINSTANCE* ObjectInst, LPVOID pvRef) {
 	try {
 		std::string GUIDString = *reinterpret_cast<std::string*>(pvRef);
-		if ((ObjectInst->dwFlags & DIDOI_FFACTUATOR) != 0) {
+		if ((ObjectInst->dwFlags & DIDOI_FFACTUATOR) != 0 && (ObjectInst->dwType & DIDFT_AXIS) != 0) { // actuators on axis objects only (FFConst, SDL)
 			_DeviceFFBAxes[GUIDString].push_back(*ObjectInst);
 			LogMessage("_EnumFFBAxisCallback: Found FFB axis: %S", ObjectInst->tszName);
 		}
@@ -1716,24 +1795,6 @@ BOOL CALLBACK _EnumFFBAxisCallback(const DIDEVICEOBJECTINSTANCE* ObjectInst, LPV
 	catch (...) {
 		LogMessage("_EnumFFBAxisCallback: Unknown exception");
 		return DIENUM_STOP;
-	}
-}
-LRESULT _WindowsHookCallback(int code, WPARAM wParam, LPARAM lParam) {
-	if (code < 0)
-		return CallNextHookEx(NULL, code, wParam, lParam);
-	try {
-		PCWPSTRUCT pMsg = (PCWPSTRUCT)lParam;
-		if (pMsg->message == WM_DEVICECHANGE) {
-			LogMessage("_WindowsHookCallback: Device change detected, wParam: 0x%08X", pMsg->wParam);
-			if (g_deviceCallback) {
-				g_deviceCallback(static_cast<DBTEvents>(pMsg->wParam));
-			}
-		}
-		return CallNextHookEx(NULL, code, wParam, lParam);
-	}
-	catch (...) {
-		LogMessage("_WindowsHookCallback: Exception in hook callback");
-		return CallNextHookEx(NULL, code, wParam, lParam);
 	}
 }
 HRESULT BuildSafeArray(std::vector<std::wstring> sourceData, SAFEARRAY** SafeArrayData) {
@@ -1857,9 +1918,7 @@ FlatJoyState2 FlattenDIJOYSTATE2(DIJOYSTATE2 DeviceState) {
 		if (DeviceState.rgbButtons[i] & 0x80)
 			state.buttonsB |= (unsigned long long)1 << (i - 64);
 	}
-	auto ClampToUInt16 = [](LONG value) -> uint16_t {
-		return static_cast<uint16_t>(std::clamp(value, 0L, static_cast<LONG>(UINT16_MAX)));
-		};
+	using diffb::ClampToUInt16;
 	state.lX = ClampToUInt16(DeviceState.lX);
 	state.lY = ClampToUInt16(DeviceState.lY);
 	state.lZ = ClampToUInt16(DeviceState.lZ);
@@ -1893,16 +1952,7 @@ FlatJoyState2 FlattenDIJOYSTATE2(DIJOYSTATE2 DeviceState) {
 	state.lFRy = ClampToUInt16(DeviceState.lFRy);
 	state.lFRz = ClampToUInt16(DeviceState.lFRz);
 	for (int i = 0; i < 4; i++) {
-		DWORD pov = DeviceState.rgdwPOV[i];
-		if (LOWORD(pov) == 0xFFFF) continue;
-		if (pov < 4500 || pov >= 31500)
-			state.rgdwPOV |= (uint16_t)(1 << (i * 4 + 0));
-		if (pov >= 4500 && pov < 13500)
-			state.rgdwPOV |= (uint16_t)(1 << (i * 4 + 3));
-		if (pov >= 13500 && pov < 22500)
-			state.rgdwPOV |= (uint16_t)(1 << (i * 4 + 1));
-		if (pov >= 22500 && pov < 31500)
-			state.rgdwPOV |= (uint16_t)(1 << (i * 4 + 2));
+		state.rgdwPOV |= static_cast<uint16_t>(diffb::PovToDpadBits(DeviceState.rgdwPOV[i]) << (i * 4));
 	}
 	return state;
 }
