@@ -6,6 +6,7 @@
 #include "DirectInputHelpers.h"
 #include <strsafe.h>
 #include <dbt.h>
+#include <mutex>
 LPDIRECTINPUT8 _DirectInput = nullptr;
 bool g_UnityInitialized = false;
 std::string g_LastErrorMessage;
@@ -18,6 +19,9 @@ std::map<DeviceGUID, std::map<Effects::Type, DIEFFECT>> _DeviceFFBEffectConfig;
 std::map<DeviceGUID, std::map<Effects::Type, LPDIRECTINPUTEFFECT>> _DeviceFFBEffectControl;
 DeviceChangeCallback g_deviceCallback = nullptr;
 std::vector<std::wstring> DEBUGDATA;
+// Managed code enumerates from a thread-pool thread while the main thread polls; one lock serialises every
+// export. Recursive so a WM_DEVICECHANGE callback that re-enters the API on the window's thread cannot deadlock.
+static std::recursive_mutex g_apiLock;
 char* SafeStrDup(const char* source) {
 	if (!source) {
 		LogMessage("SafeStrDup: Source string is null");
@@ -172,6 +176,7 @@ static HRESULT ReacquireDeviceAndEffects(const std::string& GUIDString) {
 	return S_OK;
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT StartDirectInput() {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	if (_DirectInput != nullptr) {
 		LogMessage("DirectInput already initialized");
 		return S_OK;
@@ -192,6 +197,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT StartDirectInput() {
 	return S_OK;
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT StopDirectInput() {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	HRESULT hr = S_OK;
 	if (_DirectInput == nullptr) {
 		LogMessage("StopDirectInput: DirectInput already stopped");
@@ -231,6 +237,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT StopDirectInput() {
 	return S_OK;
 }
 DIRECTINPUTFORCEFEEDBACK_API DeviceInfo* EnumerateDevices(int& deviceCount) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		HRESULT hr = E_FAIL;
 		deviceCount = 0;
@@ -292,6 +299,7 @@ DIRECTINPUTFORCEFEEDBACK_API DeviceInfo* EnumerateDevices(int& deviceCount) {
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateDevice(LPCSTR guidInstance) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		HRESULT hr = E_FAIL;
 		if (!g_UnityInitialized) {
@@ -370,6 +378,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateDevice(LPCSTR guidInstance) {
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyDevice(LPCSTR guidInstance) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("DestroyDevice: Invalid GUID (null)");
@@ -416,6 +425,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyDevice(LPCSTR guidInstance) {
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceState(LPCSTR guidInstance, FlatJoyState2& deviceState) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("GetDeviceState: Invalid GUID (null)");
@@ -465,6 +475,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceState(LPCSTR guidInstance, FlatJoy
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceStateRaw(LPCSTR guidInstance, DIJOYSTATE2& deviceState) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("GetDeviceStateRaw: Invalid GUID (null)");
@@ -512,6 +523,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceStateRaw(LPCSTR guidInstance, DIJO
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceCapabilities(LPCSTR guidInstance, DIDEVCAPS& deviceCapabilitiesOut) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("GetDeviceCapabilities: Invalid GUID (null)");
@@ -547,6 +559,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceCapabilities(LPCSTR guidInstance, 
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT SetAutocenter(LPCSTR guidInstance, bool AutocenterState) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("SetAutocenter: Invalid GUID (null)");
@@ -594,6 +607,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT SetAutocenter(LPCSTR guidInstance, bool Aut
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT GetActiveDevices(int* count, const char*** outStrings) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!count || !outStrings) {
 			LogMessage("GetActiveDevices: Invalid output parameters");
@@ -646,6 +660,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetActiveDevices(int* count, const char*** 
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT EnumerateFFBEffects(LPCSTR guidInstance, int* count, const char*** outStrings) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		*count = 0;
 		*outStrings = nullptr;
@@ -714,6 +729,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT EnumerateFFBEffects(LPCSTR guidInstance, in
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT EnumerateFFBAxes(LPCSTR guidInstance, int* count, const char*** outStrings) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		*count = 0;
 		*outStrings = nullptr;
@@ -735,6 +751,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT EnumerateFFBAxes(LPCSTR guidInstance, int* 
 		HRESULT hr = _ActiveDevices[GUIDString]->EnumObjects(&_EnumFFBAxisCallback, &GUIDString, DIDFT_ALL);
 		if (FAILED(hr)) {
 			LogMessage("EnumerateFFBAxes: Failed to enumerate axes: 0x%08X", hr);
+			_DeviceFFBAxes.erase(GUIDString);
 			return hr;
 		}
 		std::vector<std::wstring> axesData;
@@ -788,6 +805,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT EnumerateFFBAxes(LPCSTR guidInstance, int* 
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API void FreeStringArray(const char** strings, int count) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	if (!strings) {
 		LogMessage("FreeStringArray: Null pointer provided");
 		return;
@@ -806,6 +824,7 @@ DIRECTINPUTFORCEFEEDBACK_API void FreeStringArray(const char** strings, int coun
 	LogMessage("FreeStringArray: Successfully freed %d strings", count);
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("CreateFFBEffect: Invalid GUID (null)");
@@ -836,6 +855,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateFFBEffect(LPCSTR guidInstance, Effect
 			HRESULT hr = _ActiveDevices[GUIDString]->EnumObjects(&_EnumFFBAxisCallback, &GUIDString, DIDFT_ALL);
 			if (FAILED(hr)) {
 				LogMessage("CreateFFBEffect: Failed to enumerate FFB axes: 0x%08X", hr);
+				_DeviceFFBAxes.erase(GUIDString);
 				return hr;
 			}
 		}
@@ -913,6 +933,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateFFBEffect(LPCSTR guidInstance, Effect
 			ZeroMemory(rampForce, sizeof(DIRAMPFORCE));
 			rampForce->lStart = 0;
 			rampForce->lEnd = 0;
+			effect.dwDuration = DI_SECONDS; // a ramp cannot be INFINITE; UpdateRampForce sets the real duration
 			effect.cbTypeSpecificParams = sizeof(DIRAMPFORCE);
 			effect.lpvTypeSpecificParams = rampForce;
 			LogMessage("CreateFFBEffect: Creating Ramp Force effect");
@@ -999,6 +1020,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateFFBEffect(LPCSTR guidInstance, Effect
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("DestroyFFBEffect: Invalid GUID (null)");
@@ -1094,6 +1116,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effec
 	}
 }
 extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT GetFFBEffectStatus(LPCSTR guidInstance, Effects::Type effectType, DWORD* status) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!status) {
 			return E_POINTER;
@@ -1118,6 +1141,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT GetFFBEffectStatus(LPCSTR guidIn
 	}
 }
 extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT GetSupportedFFBEffects(LPCSTR guidInstance, DWORD* mask) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!mask) {
 			return E_POINTER;
@@ -1153,6 +1177,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT GetSupportedFFBEffects(LPCSTR gu
 }
 extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConstantForce(LPCSTR guidInstance, int magnitude)
 {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("UpdateConstantForce: Invalid GUID (null)");
@@ -1209,6 +1234,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConstantForce(LPCSTR guidI
 }
 extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdatePeriodicForce(LPCSTR guidInstance, Effects::Type effectType, int magnitude, DWORD period, int offset)
 {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("UpdatePeriodicForce: Invalid GUID (null)");
@@ -1274,8 +1300,9 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdatePeriodicForce(LPCSTR guidI
 		return E_FAIL;
 	}
 }
-extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateRampForce(LPCSTR guidInstance, int startMagnitude, int endMagnitude)
+extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateRampForce(LPCSTR guidInstance, int startMagnitude, int endMagnitude, DWORD durationMicroseconds)
 {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("UpdateRampForce: Invalid GUID (null)");
@@ -1303,17 +1330,22 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateRampForce(LPCSTR guidInsta
 		}
 		int clampedStart = (startMagnitude > 10000) ? 10000 : (startMagnitude < -10000) ? -10000 : startMagnitude;
 		int clampedEnd = (endMagnitude > 10000) ? 10000 : (endMagnitude < -10000) ? -10000 : endMagnitude;
+		if (durationMicroseconds == 0 || durationMicroseconds == INFINITE) {
+			LogMessage("UpdateRampForce: duration must be finite and non-zero");
+			return E_INVALIDARG;
+		}
+		effectConfig.dwDuration = durationMicroseconds;
 		rf->lStart = clampedStart;
 		rf->lEnd = clampedEnd;
 		HRESULT hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::RampForce]->SetParameters(
-			&effectConfig, DIEP_TYPESPECIFICPARAMS
+			&effectConfig, DIEP_TYPESPECIFICPARAMS | DIEP_DURATION | DIEP_START
 		);
 		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
 			LogMessage("UpdateRampForce: Device lost, reacquiring");
 			hr = ReacquireDeviceAndEffects(GUIDString);
 			if (SUCCEEDED(hr)) {
 				hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::RampForce]->SetParameters(
-					&effectConfig, DIEP_TYPESPECIFICPARAMS
+					&effectConfig, DIEP_TYPESPECIFICPARAMS | DIEP_DURATION | DIEP_START
 				);
 			}
 		}
@@ -1336,6 +1368,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConditionForce(LPCSTR guid
 	int offset, int positiveCoefficient, int negativeCoefficient,
 	DWORD positiveSaturation, DWORD negativeSaturation, int deadBand)
 {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("UpdateConditionForce: Invalid GUID (null)");
@@ -1412,6 +1445,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConditionForce(LPCSTR guid
 }
 extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateCustomForce(LPCSTR guidInstance, int* forceData, int sampleCount, DWORD samplePeriod)
 {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance || !forceData || sampleCount <= 0) {
 			LogMessage("UpdateCustomForce: Invalid parameters");
@@ -1437,11 +1471,11 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateCustomForce(LPCSTR guidIns
 			LogMessage("UpdateCustomForce: Invalid custom force parameters");
 			return E_POINTER;
 		}
-		if (cf->cSamples != sampleCount) {
-			if (cf->rglForceData) {
-				delete[] cf->rglForceData;
-			}
-			cf->rglForceData = new LONG[sampleCount];
+		if (cf->cSamples != static_cast<DWORD>(sampleCount)) {
+			LONG* fresh = new (std::nothrow) LONG[sampleCount];
+			if (!fresh) return E_OUTOFMEMORY;
+			delete[] cf->rglForceData;
+			cf->rglForceData = fresh;
 			cf->cSamples = sampleCount;
 			LogMessage("UpdateCustomForce: Resized force data array to %d samples", sampleCount);
 		}
@@ -1478,6 +1512,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateCustomForce(LPCSTR guidIns
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT StopAllFFBEffects(LPCSTR guidInstance) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		if (!guidInstance) {
 			LogMessage("StopAllFFBEffects: Invalid GUID (null)");
@@ -1519,6 +1554,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT StopAllFFBEffects(LPCSTR guidInstance) {
 	}
 }
 DIRECTINPUTFORCEFEEDBACK_API void SetDeviceChangeCallback(DeviceChangeCallback CB) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	g_deviceCallback = CB;
 	if (CB) {
 		EnsureHiddenWindow(); // notifications must flow before any device is attached
@@ -1532,6 +1568,7 @@ DIRECTINPUTFORCEFEEDBACK_API bool IsDirectInputInitialized() {
 	return _DirectInput != nullptr;
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDILastError(char* buffer, int bufferSize) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	if (!buffer) {
 		LogMessage("GetDILastError: Buffer pointer is null");
 		return E_INVALIDARG;
@@ -1566,6 +1603,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDILastError(char* buffer, int bufferSize
 	return S_OK;
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT DEBUG1(LPCSTR guidInstance, SAFEARRAY** DebugData) {
+	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
 		HRESULT hr = E_FAIL;
 		std::vector<std::wstring> debugInfo;
@@ -1629,8 +1667,9 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DEBUG1(LPCSTR guidInstance, SAFEARRAY** Deb
 		if (!_DeviceFFBAxes.contains(GUIDString)) {
 			_DeviceFFBAxes[GUIDString].clear();
 			hr = _ActiveDevices[GUIDString]->EnumObjects(&_EnumFFBAxisCallback, &GUIDString, DIDFT_ALL);
+			if (FAILED(hr)) _DeviceFFBAxes.erase(GUIDString);
 		}
-		if (_DeviceFFBAxes[GUIDString].empty()) {
+		if (!_DeviceFFBAxes.contains(GUIDString) || _DeviceFFBAxes[GUIDString].empty()) {
 			debugInfo.push_back(L"  - No FFB axes found");
 		}
 		else {
