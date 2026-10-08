@@ -14,7 +14,6 @@ using UnityEditor.PackageManager;
 #endif
 #if UNITY_STANDALONE_WIN
 using UnityEngine;
-using UnityEngine;
 #endif
 
 namespace DirectInputManager
@@ -134,11 +133,12 @@ namespace DirectInputManager
         //////////////////////////////////////////////////////////////
         // Cross Platform "Macros" - Allows lib to work in Visual Studio & Unity
         //////////////////////////////////////////////////////////////
+        internal static bool showLogsRuntime = false; // read by the Unity on-screen logger path only
+
 #if UNITY_STANDALONE_WIN
         private static uint ClampAgnostic(uint value, uint min, uint max) => (uint)Mathf.Clamp(value, min, max);
         private static int ClampAgnostic(int value, int min, int max) => Mathf.Clamp(value, min, max);
 
-        internal static bool showLogsRuntime;
         private static void DebugLog(string message)
         {
             // Send to console too
@@ -247,10 +247,16 @@ namespace DirectInputManager
         public static bool Attach(string guidInstance)
         {
             if (_activeDevices.ContainsKey(guidInstance)) { return true; } // We're already attached to that device
-            int hresult = Native.CreateDevice(guidInstance);
-            if (hresult != 0) { DebugLog($"CreateDevice Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)} {guidInstance}"); return false; }
-            DeviceInfo device = _devices.Where(device => device.guidInstance == guidInstance).First();
-            _activeDevices.Add(guidInstance, new ActiveDeviceInfo() { deviceInfo = device }); // Add device to our C# active device tracker (Dictionary allows us to easily check if GUID already exists)
+            int index = Array.FindIndex(_devices, d => d.guidInstance == guidInstance);
+            if (index < 0)
+            {
+                LastHResult = unchecked((int)0x80070490); // HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+                LastError = $"Attach: device {guidInstance} is not in the enumerated device list; call EnumerateDevices first";
+                DebugLog(LastError);
+                return false;
+            }
+            if (!Check("CreateDevice", Native.CreateDevice(guidInstance), guidInstance)) { return false; }
+            _activeDevices.Add(guidInstance, new ActiveDeviceInfo() { deviceInfo = _devices[index] }); // Add device to our C# active device tracker (Dictionary allows us to easily check if GUID already exists)
             return true;
         }
 
@@ -266,8 +272,7 @@ namespace DirectInputManager
             if (!_activeDevices.ContainsKey(guidInstance)) { return true; } // We don't think we're attached to that device, consider it removed
             int hresult = Native.DestroyDevice(guidInstance);
             _activeDevices.Remove(guidInstance); // remove from our C# active device tracker
-            if (hresult != 0) { DebugLog($"DestroyDevice Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)}"); return false; }
-            return true;
+            return Check("DestroyDevice", hresult, guidInstance);
         }
 
         /// <summary>
@@ -364,6 +369,27 @@ namespace DirectInputManager
         }
 
         /// <summary>
+        /// HRESULT of the most recent native call made through a DIManager method that reports
+        /// success or failure (0 on success). Lets a caller show the actual API error instead of a bare false.
+        /// </summary>
+        public static int LastHResult { get; private set; }
+
+        /// <summary>
+        /// Human readable description of the most recent failure reported by a DIManager method, or empty.
+        /// </summary>
+        public static string LastError { get; private set; } = "";
+
+        // Records the outcome of a native call. Logs failures unless the caller is a per-frame update path.
+        private static bool Check(string operation, int hresult, string detail = "", bool log = true)
+        {
+            LastHResult = hresult;
+            if (hresult == 0) { LastError = ""; return true; }
+            LastError = $"{operation} failed: {WinErrors.Describe(hresult)} {detail}".TrimEnd();
+            if (log) { DebugLog(LastError); }
+            return false;
+        }
+
+        /// <summary>
         /// Retrieve the capabilities of the device. E.g. # Buttons, # Axes, Driver Version<br/>
         /// Device must be attached first<br/>
         /// </summary>
@@ -409,9 +435,7 @@ namespace DirectInputManager
         /// </returns>
         public static bool EnableFFBEffect(string guidInstance, FFBEffects effectType)
         {
-            int hresult = Native.CreateFFBEffect(guidInstance, effectType);
-            if (hresult != 0) { DebugLog($"CreateFFBEffect Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)}"); return false; }
-            return true;
+            return Check("CreateFFBEffect", Native.CreateFFBEffect(guidInstance, effectType), effectType.ToString());
         }
 
         /// <summary>
@@ -423,9 +447,7 @@ namespace DirectInputManager
         /// </returns>
         public static bool DestroyFFBEffect(string guidInstance, FFBEffects effectType)
         {
-            int hresult = Native.DestroyFFBEffect(guidInstance, effectType);
-            if (hresult != 0) { DebugLog($"DestroyFFBEffect Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)}"); return false; }
-            return true;
+            return Check("DestroyFFBEffect", Native.DestroyFFBEffect(guidInstance, effectType), effectType.ToString());
         }
 
         /// <summary>
@@ -437,9 +459,7 @@ namespace DirectInputManager
         /// </returns>
         public static bool StopAllFFBEffects(string guidInstance)
         {
-            int hresult = Native.StopAllFFBEffects(guidInstance);
-            if (hresult != 0) { DebugLog($"StopAllFFBEffects Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)}"); return false; }
-            return true;
+            return Check("StopAllFFBEffects", Native.StopAllFFBEffects(guidInstance), guidInstance);
         }
 
         /// <summary>
@@ -450,9 +470,7 @@ namespace DirectInputManager
         /// </returns>
         public static bool StopDirectInput()
         {
-            int hresult = Native.StopDirectInput();
-            if (hresult != 0) { DebugLog($"StopDirectInput Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)}"); return false; }
-            return true;
+            return Check("StopDirectInput", Native.StopDirectInput());
         }
 
         /// <summary>
@@ -492,14 +510,13 @@ namespace DirectInputManager
         {
             if (_activeDevices.TryGetValue(guidInstance, out ActiveDeviceInfo ADI))
             { // Check if device active
-                Int32 oldHash = ADI.stateHash;
                 var state = GetDeviceState(guidInstance);
-                ADI.stateHash = state.GetHashCode();
-
-                if (oldHash != ADI.stateHash)
+                if (!ADI.hasState || !state.Equals(ADI.lastState)) // Field-wise compare: no allocation, no hashing per poll
                 {
+                    ADI.lastState = state;
+                    ADI.hasState = true;
+                    ADI.stateHash = state.GetHashCode();
                     ADI.DeviceStateChange(ADI.deviceInfo, state); // Invoke all event listeners for this device
-                                                                  //DebugLog($"{ADI.deviceInfo.productName} State Changed!");
                 }
             }
             else
@@ -738,8 +755,10 @@ namespace DirectInputManager
         /// </returns>
         public static bool UpdateDamperSimple(string guidInstance, int magnitude)
         {
+            // Saturation is the maximum force the condition may output (0..10000); 0 would silence the effect
+            // on devices that honour DIDC_SATURATION, so the simple helpers always allow full output.
             return UpdateConditionForceNative(guidInstance, FFBEffects.Damper,
-                0, magnitude, magnitude, 0, 0, 0);
+                0, magnitude, magnitude, 10000, 10000, 0);
         }
 
         /// <summary>
@@ -751,7 +770,7 @@ namespace DirectInputManager
         public static bool UpdateFrictionSimple(string guidInstance, int magnitude)
         {
             return UpdateConditionForceNative(guidInstance, FFBEffects.Friction,
-                0, magnitude, magnitude, 0, 0, 0);
+                0, magnitude, magnitude, 10000, 10000, 0);
         }
 
         /// <summary>
@@ -763,7 +782,7 @@ namespace DirectInputManager
         public static bool UpdateInertiaSimple(string guidInstance, int magnitude)
         {
             return UpdateConditionForceNative(guidInstance, FFBEffects.Inertia,
-                0, magnitude, magnitude, 0, 0, 0);
+                0, magnitude, magnitude, 10000, 10000, 0);
         }
 
         public static bool UpdatePeriodicSimple(string guidInstance, FFBEffects effectType, int magnitude, uint period = 30000, int rampStart = 0, int rampEnd = 0)
@@ -1029,8 +1048,7 @@ namespace DirectInputManager
         /// <returns>True if the update was successful</returns>
         public static bool UpdateConstantForceNative(string guidInstance, int magnitude)
         {
-            int result = Native.UpdateConstantForce(guidInstance, magnitude);
-            return result == 0;
+            return Check("UpdateConstantForce", Native.UpdateConstantForce(guidInstance, magnitude), log: false);
         }
 
         /// <summary>
@@ -1047,8 +1065,7 @@ namespace DirectInputManager
             int positiveMagnitude = Math.Abs(magnitude);
             if (positiveMagnitude > 10000) positiveMagnitude = 10000;
 
-            int result = Native.UpdatePeriodicForce(guidInstance, effectType, positiveMagnitude, period, offset);
-            return result == 0;
+            return Check("UpdatePeriodicForce", Native.UpdatePeriodicForce(guidInstance, effectType, positiveMagnitude, period, offset), log: false);
         }
 
         /// <summary>
@@ -1060,8 +1077,7 @@ namespace DirectInputManager
         /// <returns>True if the update was successful</returns>
         public static bool UpdateRampForceNative(string guidInstance, int startMagnitude, int endMagnitude)
         {
-            int result = Native.UpdateRampForce(guidInstance, startMagnitude, endMagnitude);
-            return result == 0;
+            return Check("UpdateRampForce", Native.UpdateRampForce(guidInstance, startMagnitude, endMagnitude), log: false);
         }
 
         /// <summary>
@@ -1080,10 +1096,9 @@ namespace DirectInputManager
             int offset = 0, int positiveCoefficient = 10000, int negativeCoefficient = 10000,
             uint positiveSaturation = 10000, uint negativeSaturation = 10000, int deadBand = 0)
         {
-            int result = Native.UpdateConditionForce(guidInstance, effectType,
+            return Check("UpdateConditionForce", Native.UpdateConditionForce(guidInstance, effectType,
                 offset, positiveCoefficient, negativeCoefficient,
-                positiveSaturation, negativeSaturation, deadBand);
-            return result == 0;
+                positiveSaturation, negativeSaturation, deadBand), log: false);
         }
 
         /// <summary>
@@ -1095,8 +1110,8 @@ namespace DirectInputManager
         /// <returns>True if the update was successful</returns>
         public static bool UpdateCustomForceNative(string guidInstance, int[] forceData, uint samplePeriod)
         {
-            int result = Native.UpdateCustomForce(guidInstance, forceData, forceData.Length, samplePeriod);
-            return result == 0;
+            if (forceData == null || forceData.Length == 0) { LastHResult = unchecked((int)0x80070057); LastError = "UpdateCustomForce: forceData must contain at least one sample"; return false; }
+            return Check("UpdateCustomForce", Native.UpdateCustomForce(guidInstance, forceData, forceData.Length, samplePeriod), log: false);
         }
 
     } // End of DIManager
@@ -1170,6 +1185,48 @@ namespace DirectInputManager
             }
         }
 
+        /// <summary>
+        /// Describes an HRESULT: DirectInput codes by name (FormatMessage does not know them), then the system message.
+        /// </summary>
+        public static string Describe(int hr)
+        {
+            string name = hr switch
+            {
+                0 => "DI_OK",
+                1 => "S_FALSE (DI_NOEFFECT / DI_NOTATTACHED / DI_PROPNOEFFECT)",
+                3 => "DI_DOWNLOADSKIPPED",
+                4 => "DI_EFFECTRESTARTED",
+                8 => "DI_TRUNCATED",
+                unchecked((int)0x80004001) => "DIERR_UNSUPPORTED (E_NOTIMPL)",
+                unchecked((int)0x80004003) => "E_POINTER",
+                unchecked((int)0x80004004) => "E_ABORT (DLL: effect already exists or was never created)",
+                unchecked((int)0x80004005) => "DIERR_GENERIC (E_FAIL; DLL: device not attached or DirectInput not started)",
+                unchecked((int)0x80070002) => "DIERR_NOTFOUND / DIERR_OBJECTNOTFOUND",
+                unchecked((int)0x80070005) => "DIERR_OTHERAPPHASPRIO / DIERR_READONLY / DIERR_HANDLEEXISTS (E_ACCESSDENIED)",
+                unchecked((int)0x80070006) => "E_HANDLE",
+                unchecked((int)0x8007000C) => "DIERR_NOTACQUIRED",
+                unchecked((int)0x80070015) => "DIERR_NOTINITIALIZED",
+                unchecked((int)0x8007001E) => "DIERR_INPUTLOST",
+                unchecked((int)0x80070057) => "DIERR_INVALIDPARAM (E_INVALIDARG)",
+                unchecked((int)0x800700AA) => "DIERR_ACQUIRED",
+                unchecked((int)0x80070490) => "ERROR_NOT_FOUND",
+                unchecked((int)0x80040200) => "DIERR_INSUFFICIENTPRIVS",
+                unchecked((int)0x80040201) => "DIERR_DEVICEFULL",
+                unchecked((int)0x80040202) => "DIERR_MOREDATA",
+                unchecked((int)0x80040203) => "DIERR_NOTDOWNLOADED",
+                unchecked((int)0x80040204) => "DIERR_HASEFFECTS",
+                unchecked((int)0x80040205) => "DIERR_NOTEXCLUSIVEACQUIRED",
+                unchecked((int)0x80040206) => "DIERR_INCOMPLETEEFFECT",
+                unchecked((int)0x80040207) => "DIERR_NOTBUFFERED",
+                unchecked((int)0x80040208) => "DIERR_EFFECTPLAYING",
+                unchecked((int)0x80040209) => "DIERR_UNPLUGGED",
+                unchecked((int)0x8004020A) => "DIERR_REPORTFULL",
+                _ => null,
+            };
+            string text = name != null ? name : GetSystemMessage(hr).Trim();
+            return $"0x{hr:x8} {text}";
+        }
+
         public static string PtrToStringUTF8(IntPtr ptr) //by Risto-Paasivirta
         {
             int len = 0;
@@ -1208,6 +1265,9 @@ namespace DirectInputManager
             CancelAllTokens();                                                 // Cancel existing Tokens Each invocation
             var tokenSource = new CancellationTokenSource();                   // Token for this invocation
             lock (_lockThis) { CancelTokens.Add(tokenSource); }                // Safely add this Token to the list
+            // Run the action on the caller's synchronization context (Unity main thread, WinForms UI thread).
+            // A thread without one (plain console host) must not throw inside a native callback, so fall back to the pool.
+            TaskScheduler scheduler = SynchronizationContext.Current != null ? TaskScheduler.FromCurrentSynchronizationContext() : TaskScheduler.Default;
             Task.Delay(TimeoutMs, tokenSource.Token).ContinueWith(task =>
             {    // (Note: All Tasks continue)
                 if (!tokenSource.IsCancellationRequested)
@@ -1216,7 +1276,7 @@ namespace DirectInputManager
                     CancelTokens = new List<CancellationTokenSource>();            // Empty List
                     lock (_lockThis) { TargetAction(); }                           // Excute Action
                 }
-            }, TaskScheduler.FromCurrentSynchronizationContext());             // Perform on current thread
+            }, scheduler);
         }
 
         private void CancelAllTokens()
@@ -1286,7 +1346,7 @@ namespace DirectInputManager
         [MarshalAs(UnmanagedType.LPStr)] public string guidProduct;
         [MarshalAs(UnmanagedType.LPStr)] public string instanceName;
         [MarshalAs(UnmanagedType.LPStr)] public string productName;
-        public bool FFBCapable;
+        [MarshalAs(UnmanagedType.I1)] public bool FFBCapable; // native field is a one-byte C++ bool, not a four-byte BOOL
     }
 
     public delegate void deviceInfoEvent(DeviceInfo device); // delegate for handling events that pass DeviceInfo
@@ -1297,7 +1357,9 @@ namespace DirectInputManager
     public class ActiveDeviceInfo
     {
         public DeviceInfo deviceInfo;                     // Hold the info about the device
-        public Int32 stateHash;                           // Hold the hash of the last known state
+        public Int32 stateHash;                           // Hash of the last known state (see FlatJoyState2.GetHashCode)
+        public FlatJoyState2 lastState;                   // Last state delivered through OnDeviceStateChange
+        public bool hasState;                             // False until the first poll has delivered a state
         public event deviceInfoEvent OnDeviceRemoved;     // Event to add listners too
         public event deviceStateEvent OnDeviceStateChange; // Event to add listners too
         public void DeviceRemoved(DeviceInfo device) { OnDeviceRemoved?.Invoke(device); }         // Function to invoke event listeners
@@ -1412,7 +1474,7 @@ namespace DirectInputManager
     /// See https://docs.microsoft.com/en-us/previous-versions/windows/desktop/ee416628(v=vs.85)
     /// </summary>
     [Serializable]
-    public struct FlatJoyState2
+    public struct FlatJoyState2 : IEquatable<FlatJoyState2>
     { // Axis trimmed from "LONG" UInt32 to UInt16 as values range 0-65535?
         public UInt64 buttonsA; // Buttons seperated into banks of 64-Bits to fit into Unsigned 64-bit integer
         public UInt64 buttonsB; // Buttons seperated into banks of 64-Bits to fit into Unsigned 64-bit integer
@@ -1449,9 +1511,36 @@ namespace DirectInputManager
         public UInt16 lFRy;     // Y-axis torque
         public UInt16 lFRz;     // Z-axis torque
         public UInt16 rgdwPOV;  // Store each DPAD in chunks of 4 bits inside 16-bit UInt
+
+        /// <summary>Exact comparison of every field. This is what DIManager.Poll uses to detect a change.</summary>
+        public readonly bool Equals(FlatJoyState2 o) =>
+            buttonsA == o.buttonsA && buttonsB == o.buttonsB &&
+            lX == o.lX && lY == o.lY && lZ == o.lZ && lU == o.lU && lV == o.lV &&
+            lRx == o.lRx && lRy == o.lRy && lRz == o.lRz &&
+            lVX == o.lVX && lVY == o.lVY && lVZ == o.lVZ && lVU == o.lVU && lVV == o.lVV &&
+            lVRx == o.lVRx && lVRy == o.lVRy && lVRz == o.lVRz &&
+            lAX == o.lAX && lAY == o.lAY && lAZ == o.lAZ && lAU == o.lAU && lAV == o.lAV &&
+            lARx == o.lARx && lARy == o.lARy && lARz == o.lARz &&
+            lFX == o.lFX && lFY == o.lFY && lFZ == o.lFZ && lFU == o.lFU && lFV == o.lFV &&
+            lFRx == o.lFRx && lFRy == o.lFRy && lFRz == o.lFRz &&
+            rgdwPOV == o.rgdwPOV;
+
+        public override readonly bool Equals(object obj) => obj is FlatJoyState2 o && Equals(o);
+
+        /// <summary>
+        /// Cheap hash over buttons, the eight primary axes and the POVs. Not a full-state digest:
+        /// use Equals for exact comparison, or DIManager.FlatStateMD5 for a digest.
+        /// </summary>
         public override readonly int GetHashCode()
         {
-            return BitConverter.ToInt32(DIManager.FlatStateMD5(this), 0);
+            unchecked
+            {
+                ulong h = buttonsA * 0x9E3779B97F4A7C15UL ^ buttonsB;
+                h = h * 31 + ((ulong)lX | (ulong)lY << 16 | (ulong)lZ << 32 | (ulong)lRz << 48);
+                h = h * 31 + ((ulong)lU | (ulong)lV << 16 | (ulong)lRx << 32 | (ulong)lRy << 48);
+                h = h * 31 + rgdwPOV;
+                return (int)h ^ (int)(h >> 32);
+            }
         }
     }
 
