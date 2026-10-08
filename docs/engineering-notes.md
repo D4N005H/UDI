@@ -87,10 +87,11 @@ Severity: C critical, H high, M medium, L low. "Fixed" names the commit.
 Refuter column: independent adversarial verification run in a fresh context
 (workflow). The refuters ran while the fixes were landing, so several verdicts
 read "the quoted code no longer exists": those are recorded as "fix present".
-The workflow was stopped after the native findings because every remaining
-verdict would have been a re-check of code already replaced; the managed and
-Explorer findings were verified against the source by the lead instead
-(section 3 states each one as VERIFIED only after that read).
+The remaining refuters (N12 onward, managed, Explorer) were still running at
+handoff time and were not waited for, since each would re-check code already
+replaced; the managed and Explorer findings were verified against the source
+by the lead instead (section 3 states each one as VERIFIED only after that
+read).
 
 ### Baseline and managed layer
 
