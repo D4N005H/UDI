@@ -125,6 +125,8 @@ extern "C" { // Everything to be made available by the DLL
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effects::Type effectType);
 	// *status receives the IDirectInputEffect::GetEffectStatus flags (DIEGES_PLAYING = 1). E_ABORT when the effect was never created.
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT GetFFBEffectStatus(LPCSTR guidInstance, Effects::Type effectType, /*[out]*/ DWORD* status);
+	// *mask bit n is set when the device enumerates the standard effect with Effects::Type value n (vendor effects are ignored).
+	DIRECTINPUTFORCEFEEDBACK_API HRESULT GetSupportedFFBEffects(LPCSTR guidInstance, /*[out]*/ DWORD* mask);
 
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConstantForce(LPCSTR guidInstance, int magnitude);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdatePeriodicForce(LPCSTR guidInstance, Effects::Type effectType, int magnitude, DWORD period, int offset);

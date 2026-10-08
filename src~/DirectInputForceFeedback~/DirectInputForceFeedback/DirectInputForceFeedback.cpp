@@ -1117,6 +1117,40 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT GetFFBEffectStatus(LPCSTR guidIn
 		return E_FAIL;
 	}
 }
+extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT GetSupportedFFBEffects(LPCSTR guidInstance, DWORD* mask) {
+	try {
+		if (!mask) {
+			return E_POINTER;
+		}
+		*mask = 0;
+		if (!guidInstance || !IsValidGUIDString(guidInstance)) {
+			return E_INVALIDARG;
+		}
+		std::string GUIDString(guidInstance);
+		if (!_ActiveDevices.contains(GUIDString)) {
+			return E_FAIL;
+		}
+		_DeviceEnumeratedEffects[GUIDString].clear();
+		HRESULT hr = _ActiveDevices[GUIDString]->EnumEffects(&_EnumFFBEffectsCallback, &GUIDString, DIEFT_ALL);
+		if (FAILED(hr)) {
+			LogMessage("GetSupportedFFBEffects: Failed to enumerate effects: 0x%08X", hr);
+			return hr;
+		}
+		for (const auto& info : _DeviceEnumeratedEffects[GUIDString]) {
+			for (int t = 0; t <= static_cast<int>(Effects::Type::CustomForce); t++) {
+				if (info.guid == EffectTypeToGUID(static_cast<Effects::Type>(t))) {
+					*mask |= (1u << t);
+					break;
+				}
+			}
+		}
+		return S_OK;
+	}
+	catch (...) {
+		LogMessage("GetSupportedFFBEffects: Unknown exception");
+		return E_FAIL;
+	}
+}
 extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConstantForce(LPCSTR guidInstance, int magnitude)
 {
 	try {
