@@ -85,7 +85,12 @@ leaves the window until process exit (logged, shortcut noted in code).
 
 Severity: C critical, H high, M medium, L low. "Fixed" names the commit.
 Refuter column: independent adversarial verification run in a fresh context
-(workflow); "pending" means the verdict had not arrived at handoff time.
+(workflow). The refuters ran while the fixes were landing, so several verdicts
+read "the quoted code no longer exists": those are recorded as "fix present".
+The workflow was stopped after the native findings because every remaining
+verdict would have been a re-check of code already replaced; the managed and
+Explorer findings were verified against the source by the lead instead
+(section 3 states each one as VERIFIED only after that read).
 
 ### Baseline and managed layer
 
@@ -99,7 +104,7 @@ Refuter column: independent adversarial verification run in a fresh context
 | B1 | M | `Check` | `!= 0` treated `DI_DOWNLOADSKIPPED`/`DI_EFFECTRESTARTED`/`DI_TRUNCATED` as failures. | Fixed 53eb4f3 (`hresult >= 0`). |
 | B2 | M | `UpdateCustomForceNative` | Empty array reached the DLL. | Fixed 53eb4f3 (E_INVALIDARG). |
 | B3 | H | `UpdateDamperSimple` etc. | Saturation 0 sent (HYPOTHESIS that drivers then produce no force; ledger entry 12). | Fixed 53eb4f3 (10000). |
-| M1 | H | `Poll` | A failed read left a zeroed struct that was published; Unity turned it into full-lock axis input. | Fixed f704de1 (bail out on failure). Refuter pending. |
+| M1 | H | `Poll` | A failed read left a zeroed struct that was published; Unity turned it into full-lock axis input. | Fixed f704de1 (bail out on failure). |
 | M2 | H | `GenerateISLayouts` | `WithProduct` treated product names as regex; metacharacters meant no match and the device was dropped. | Fixed f704de1 (`supportRegex: false`). |
 | M3 | M | `DirectInputDevice.Initialize` | `Initialize()` result ignored; DllNotFoundException escaped the static constructor. | Fixed f704de1. |
 | M4 | M | native `StartDirectInput` | Returned S_OK when `DirectInput8Create` failed. | Fixed ab18e34. |
@@ -120,16 +125,16 @@ Refuter column: independent adversarial verification run in a fresh context
 | N1 | H | Poll-path reacquire used a bare `Acquire()`; effects stayed stopped, later updates returned S_OK. | Fixed ab18e34 (`ReacquireDeviceAndEffects`). | not refuted (medium) |
 | N2 | H | No synchronisation; `g_LastErrorMessage` and the maps shared across threads. | Fixed 0261d06 (`std::recursive_mutex` in every export). | not refuted |
 | N3 | M | Direction 10000 on every axis: 45 degree diagonal on two actuators. | Fixed b43826d (10000 on the first actuator, 0 elsewhere). DESIGN DECISION below. | not refuted (medium) |
-| N4 | M | Ramp created with INFINITE duration (ledger 8: a ramp cannot be INFINITE, PROVISIONAL). | Fixed 0261d06 (1 s at creation; `UpdateRampForce` takes the duration, sets `DIEP_DURATION | DIEP_START`). | not refuted |
-| N5 | M | `DEBUG1` applied 50 % constant force as a side effect. | Fixed ab18e34 (reports `GetEffectStatus` instead). | pending |
-| N6 | M | POV diagonals collapsed to one cardinal bit. | Fixed ab18e34 (`PovToDpadBits`, unit-tested). | pending |
-| N7 | M | Cooperative level bound to `GetForegroundWindow()`. | Fixed ab18e34 (owned hidden window). | pending |
-| N8 | M | No `RegisterDeviceNotification`; hot-plug dead. | Fixed ab18e34. | pending |
-| N9 | L | Custom-force buffer freed before the new one was allocated. | Fixed 0261d06. | pending |
-| N10 | L | `EnumObjects` failure cached an empty axis list until `DestroyDevice`. | Fixed 0261d06. | pending |
-| N12 | L | Win32 configurations cannot build (C++17 setting, `std::map::contains`); calling convention would mismatch. | Proposal P2. | pending |
-| N13 | L | `GetDILastError` never cleared, not set on most failures, not declared in managed code. | Documented; proposal P3. | pending |
-| N14 | L | `FlattenDIJOYSTATE2` clamps every field to 0..65535, dropping negative velocity/acceleration/force values. | Documented contract: axes 0..65535 (DirectInput default range, ledger 38 PROVISIONAL). HYPOTHESIS that no supported device reports the signed fields. | pending |
+| N4 | M | Ramp created with INFINITE duration (ledger 8: a ramp cannot be INFINITE, PROVISIONAL). | Fixed 0261d06 (1 s at creation; `UpdateRampForce` takes the duration, sets `DIEP_DURATION | DIEP_START`). | code facts confirmed; the driver rejection path is unconfirmed by any readable source (stays HYPOTHESIS, low) |
+| N5 | M | `DEBUG1` applied 50 % constant force as a side effect. | Fixed ab18e34 (reports `GetEffectStatus` instead). | not refuted, fix present |
+| N6 | M | POV diagonals collapsed to one cardinal bit. | Fixed ab18e34 (`PovToDpadBits`, unit-tested). | fix present |
+| N7 | M | Cooperative level bound to `GetForegroundWindow()`. | Fixed ab18e34 (owned hidden window). | fix present |
+| N8 | M | No `RegisterDeviceNotification`; hot-plug dead. | Fixed ab18e34. | fix present |
+| N9 | L | Custom-force buffer freed before the new one was allocated. | Fixed 0261d06. | fix present |
+| N10 | L | `EnumObjects` failure cached an empty axis list until `DestroyDevice`. | Fixed 0261d06. | fix present |
+| N12 | L | Win32 configurations cannot build (C++17 setting, `std::map::contains`); calling convention would mismatch. | Proposal P2. | not run |
+| N13 | L | `GetDILastError` never cleared, not set on most failures, not declared in managed code. | Documented; proposal P3. | not run |
+| N14 | L | `FlattenDIJOYSTATE2` clamps every field to 0..65535, dropping negative velocity/acceleration/force values. | Documented contract: axes 0..65535 (DirectInput default range, ledger 38 PROVISIONAL). HYPOTHESIS that no supported device reports the signed fields. | not run |
 | S1 | M | Custom-force sample period 0 passed to the driver with undocumented meaning. | Fixed 78e3831 (0 keeps the `DIDEVCAPS` period used at creation). | n/a |
 | S2 | L | `_EnumFFBAxisCallback` accepted any `DIDOI_FFACTUATOR` object, not only axes. | Fixed ab18e34 (`DIDFT_AXIS` required, as SDL does). | n/a |
 
