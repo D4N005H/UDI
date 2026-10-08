@@ -12,7 +12,7 @@ using System.Text;
 #if UNITY_EDITOR
 using UnityEditor.PackageManager;
 #endif
-#if UNITY_STANDALONE_WIN
+#if UNITY_5_3_OR_NEWER
 using UnityEngine;
 #endif
 
@@ -20,12 +20,8 @@ namespace DirectInputManager
 {
     class Native
     {
-#if UNITY_64 // meaning if it is a Unity build, to avoid Unity in wrong build modes (e.g. unsupported platforms like Android) throwing errors.
-             // Note that this a Windows 64 bit only asset! Though any game built for Windows 64bit may be playable via emulators on Linux.
+        // Windows x64 only. Unity ships the DLL from Runtime/Plugins/DLL; the Explorer csproj copies it next to the exe.
         const string DLLFile = @"DirectInputForceFeedback.dll";
-#else
-        const string DLLFile = @"..\..\..\..\..\..\Runtime\Plugins\DLL\DirectInputForceFeedback.dll";
-#endif
         [DllImport(DLLFile, CharSet = CharSet.Ansi, EntryPoint = "UpdateConstantForce")]
         internal static extern int UpdateConstantForceSimple([MarshalAs(UnmanagedType.LPStr)] string guidInstance, int magnitude);
 
@@ -78,7 +74,7 @@ namespace DirectInputManager
         internal static extern int UpdatePeriodicForce([MarshalAs(UnmanagedType.LPStr)] string guidInstance, FFBEffects effectType, int magnitude, uint period, int offset);
 
         [DllImport(DLLFile, CharSet = CharSet.Ansi)]
-        internal static extern int UpdateRampForce([MarshalAs(UnmanagedType.LPStr)] string guidInstance, int startMagnitude, int endMagnitude);
+        internal static extern int UpdateRampForce([MarshalAs(UnmanagedType.LPStr)] string guidInstance, int startMagnitude, int endMagnitude, uint durationMicroseconds);
 
         [DllImport(DLLFile, CharSet = CharSet.Ansi)]
         internal static extern int UpdateConditionForce([MarshalAs(UnmanagedType.LPStr)] string guidInstance, FFBEffects effectType,
@@ -91,6 +87,15 @@ namespace DirectInputManager
 
         [DllImport(DLLFile, CharSet = CharSet.Ansi)]
         internal static extern int StopAllFFBEffects([MarshalAs(UnmanagedType.LPStr)] string guidInstance);
+
+        [DllImport(DLLFile, CharSet = CharSet.Ansi)]
+        internal static extern int SetAutocenter([MarshalAs(UnmanagedType.LPStr)] string guidInstance, [MarshalAs(UnmanagedType.I1)] bool autocenterState);
+
+        [DllImport(DLLFile, CharSet = CharSet.Ansi)]
+        internal static extern int GetFFBEffectStatus([MarshalAs(UnmanagedType.LPStr)] string guidInstance, FFBEffects effectType, out uint status);
+
+        [DllImport(DLLFile, CharSet = CharSet.Ansi)]
+        internal static extern int GetSupportedFFBEffects([MarshalAs(UnmanagedType.LPStr)] string guidInstance, out uint mask);
 
 
         [DllImport(DLLFile, CharSet = CharSet.Ansi)]
@@ -113,9 +118,6 @@ namespace DirectInputManager
 
 
     }
-#if UNITY_STANDALONE_WIN
-    [DefaultExecutionOrder(-1000)]
-#endif
     public class DIManager
     {
         // Define all callback delegates at class level with proper attributes
@@ -135,7 +137,7 @@ namespace DirectInputManager
         //////////////////////////////////////////////////////////////
         internal static bool showLogsRuntime = false; // read by the Unity on-screen logger path only
 
-#if UNITY_STANDALONE_WIN
+#if UNITY_5_3_OR_NEWER
         private static uint ClampAgnostic(uint value, uint min, uint max) => (uint)Mathf.Clamp(value, min, max);
         private static int ClampAgnostic(int value, int min, int max) => Mathf.Clamp(value, min, max);
 
@@ -186,12 +188,14 @@ namespace DirectInputManager
             if (_isInitialized) { return _isInitialized; }
             try
             {
-#if !UNITY_STANDALONE_WIN
+#if !UNITY_5_3_OR_NEWER
                 Native.InitializeForStandalone();
 #endif
                 if (Native.StartDirectInput() != 0) { return _isInitialized = false; }
                 s_deviceChangeCallback = OnDeviceChange;
                 Native.SetDeviceChangeCallback(s_deviceChangeCallback);
+                // The DLL outlives a Unity domain reload; a pointer to a collected delegate would crash on the next hot-plug.
+                AppDomain.CurrentDomain.DomainUnload += (sender, args) => Native.SetDeviceChangeCallback(null);
                 return _isInitialized = true;
             }
             catch (Exception ex)
@@ -372,6 +376,8 @@ namespace DirectInputManager
         /// HRESULT of the most recent native call made through a DIManager method that reports
         /// success or failure (0 on success). Lets a caller show the actual API error instead of a bare false.
         /// </summary>
+        /// <summary>The DLL returns E_ABORT for "effect not created" and "effect already exists".</summary>
+        private const int E_ABORT = unchecked((int)0x80004004);
         public static int LastHResult { get; private set; }
 
         /// <summary>
@@ -380,10 +386,12 @@ namespace DirectInputManager
         public static string LastError { get; private set; } = "";
 
         // Records the outcome of a native call. Logs failures unless the caller is a per-frame update path.
+        // HRESULT success is "not negative": DirectInput returns DI_DOWNLOADSKIPPED (3), DI_EFFECTRESTARTED (4)
+        // and DI_TRUNCATED (8) for successful calls, so a "!= 0" test would report them as failures.
         private static bool Check(string operation, int hresult, string detail = "", bool log = true)
         {
             LastHResult = hresult;
-            if (hresult == 0) { LastError = ""; return true; }
+            if (hresult >= 0) { LastError = ""; return true; }
             LastError = $"{operation} failed: {WinErrors.Describe(hresult)} {detail}".TrimEnd();
             if (log) { DebugLog(LastError); }
             return false;
@@ -463,6 +471,58 @@ namespace DirectInputManager
         }
 
         /// <summary>
+        /// Turns the device's own centering spring on or off (DIPROP_AUTOCENTER). Many wheels enable it by
+        /// default, where it fights the effects an application plays. The DLL briefly unacquires the device
+        /// to change the property and restarts active effects afterwards.
+        /// </summary>
+        public static bool SetAutocenter(string guidInstance, bool enabled)
+        {
+            return Check("SetAutocenter", Native.SetAutocenter(guidInstance, enabled), guidInstance);
+        }
+
+        /// <summary>
+        /// Which standard effect types the attached device enumerates: bit n set means FFBEffects value n
+        /// is available. Returns false, with LastError set, when the device is not attached or when the
+        /// native DLL predates this export (then treat every effect as possibly supported).
+        /// </summary>
+        public static bool TryGetSupportedFFBEffects(string guidInstance, out uint mask)
+        {
+            mask = 0;
+            try
+            {
+                return Check("GetSupportedFFBEffects", Native.GetSupportedFFBEffects(guidInstance, out mask), guidInstance);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                LastHResult = unchecked((int)0x80004001); // E_NOTIMPL
+                LastError = "GetSupportedFFBEffects: the loaded DirectInputForceFeedback.dll predates this export; rebuild it from src~/DirectInputForceFeedback~";
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Asks DirectInput whether an effect is playing right now (IDirectInputEffect::GetEffectStatus).<br/>
+        /// Returns false, with LastError set, when the effect was never created on this device or when the
+        /// native DLL predates this export.
+        /// </summary>
+        public static bool TryGetFFBEffectStatus(string guidInstance, FFBEffects effectType, out bool playing)
+        {
+            playing = false;
+            try
+            {
+                if (!Check("GetFFBEffectStatus", Native.GetFFBEffectStatus(guidInstance, effectType, out uint status), effectType.ToString(), log: false)) { return false; }
+                playing = (status & 1) != 0; // DIEGES_PLAYING
+                return true;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                LastHResult = unchecked((int)0x80004001); // E_NOTIMPL
+                LastError = "GetFFBEffectStatus: the loaded DirectInputForceFeedback.dll predates this export; rebuild it from src~/DirectInputForceFeedback~";
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Stops DirectInput<br/>
         /// </summary>
         /// <returns>
@@ -510,7 +570,8 @@ namespace DirectInputManager
         {
             if (_activeDevices.TryGetValue(guidInstance, out ActiveDeviceInfo ADI))
             { // Check if device active
-                var state = GetDeviceState(guidInstance);
+                // A failed read (device unplugged, input lost) leaves the struct zeroed; publishing it would report full-lock axes.
+                if (!Check("GetDeviceState", Native.GetDeviceState(guidInstance, out FlatJoyState2 state), guidInstance, log: false)) { return; }
                 if (!ADI.hasState || !state.Equals(ADI.lastState)) // Field-wise compare: no allocation, no hashing per poll
                 {
                     ADI.lastState = state;
@@ -584,7 +645,7 @@ namespace DirectInputManager
         /// Called from the DLL when a windows WM_DEVICECHANGE event is captured
         /// This function invokes the necessary events
         /// </summary>
-#if UNITY_STANDALONE_WIN
+#if UNITY_5_3_OR_NEWER
         [AOT.MonoPInvokeCallback(typeof(Native.DeviceChangeCallback))]
 #endif
         private static void OnDeviceChange(DBTEvents DBTEvent)
@@ -597,7 +658,8 @@ namespace DirectInputManager
         private static async void ScanDevicesForChanges()
         {
             DeviceInfo[] oldDevices = _devices;                              // Store currently known devices
-            await EnumerateDevicesAsync();                                   // Fetch what devices are available now
+            try { await EnumerateDevicesAsync(); }                           // Fetch what devices are available now
+            catch (Exception ex) { DebugLog($"ScanDevicesForChanges: enumeration failed: {ex.Message}"); return; }
 
             var removedDevices = oldDevices.Except(_devices);
             var addedDevices = _devices.Except(oldDevices);
@@ -632,7 +694,12 @@ namespace DirectInputManager
         /// negativeCoefficient: Negative of center coefficient [-10,000 - 10,000]<br/>
         /// positiveCoefficient: Positive of center Coefficient [-10,000 - 10,000]<br/>
         /// negativeSaturation: Negative of center saturation [0 - 10,000]<br/>
-        /// positiveSaturation: Positive of center saturation [0 - 10,000]<br/>
+        /// positiveSaturation: Positive of center saturation [0 - 10,000]<br/><br/>
+        /// Only element 0 reaches the DLL, which applies it to every actuator axis. For non-condition effects the
+        /// fields are reused: ConstantForce magnitude = positiveCoefficient; RampForce start/end = positive/negativeCoefficient;
+        /// periodic magnitude = positiveCoefficient, period (microseconds, unclamped) = positiveSaturation, offset = offset;
+        /// CustomForce samples = positiveCoefficient of every element, sample period (unclamped) = element 0 negativeCoefficient.
+        /// Prefer the typed Update*Native functions.
         /// </summary>
         /// <returns>
         /// A boolean representing the if the Effect updated successfully
@@ -644,6 +711,9 @@ namespace DirectInputManager
                 DebugLog("UpdateEffect: Invalid conditions array");
                 return false;
             }
+            uint period = (uint)Math.Max(0, conditions[0].positiveSaturation);
+            uint samplePeriod = (uint)Math.Max(0, conditions[0].negativeCoefficient);
+            conditions = (DICondition[])conditions.Clone(); // clamp a copy, not the caller's array
 
             // Apply clamping to all values
             for (int i = 0; i < conditions.Length; i++)
@@ -690,7 +760,7 @@ namespace DirectInputManager
                 case FFBEffects.SawtoothDown:
                     success = UpdatePeriodicForceNative(guidInstance, effectType,
                         conditions[0].positiveCoefficient,
-                        (uint)conditions[0].positiveSaturation,
+                        period,
                         conditions[0].offset);
                     break;
 
@@ -701,7 +771,6 @@ namespace DirectInputManager
                     {
                         forceData[i] = conditions[i].positiveCoefficient;
                     }
-                    uint samplePeriod = (uint)conditions[0].negativeCoefficient;
                     success = UpdateCustomForceNative(guidInstance, forceData, samplePeriod);
                     break;
 
@@ -791,17 +860,8 @@ namespace DirectInputManager
             if (effectType == FFBEffects.RampForce)
             {
                 bool success = UpdateRampForceNative(guidInstance, rampStart, rampEnd);
-                if (!success)
+                if (!success && LastHResult == E_ABORT && EnableFFBEffect(guidInstance, effectType)) // effect not created yet
                 {
-                    // If update failed, try creating the effect first
-                    int hresult = Native.CreateFFBEffect(guidInstance, effectType);
-                    if (hresult != 0)
-                    {
-                        DebugLog($"CreateFFBEffect Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)}");
-                        return false;
-                    }
-
-                    // Try updating again
                     success = UpdateRampForceNative(guidInstance, rampStart, rampEnd);
                 }
                 return success;
@@ -810,17 +870,8 @@ namespace DirectInputManager
             else
             {
                 bool success = UpdatePeriodicForceNative(guidInstance, effectType, magnitude, period, 0);
-                if (!success)
+                if (!success && LastHResult == E_ABORT && EnableFFBEffect(guidInstance, effectType)) // effect not created yet
                 {
-                    // If update failed, try creating the effect first
-                    int hresult = Native.CreateFFBEffect(guidInstance, effectType);
-                    if (hresult != 0)
-                    {
-                        DebugLog($"CreateFFBEffect Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)}");
-                        return false;
-                    }
-
-                    // Try updating again
                     success = UpdatePeriodicForceNative(guidInstance, effectType, magnitude, period, 0);
                 }
                 return success;
@@ -836,17 +887,8 @@ namespace DirectInputManager
             }
 
             bool success = UpdateCustomForceNative(guidInstance, forceData, samplePeriod);
-            if (!success)
+            if (!success && LastHResult == E_ABORT && EnableFFBEffect(guidInstance, FFBEffects.CustomForce)) // effect not created yet
             {
-                // If update failed, try creating the effect first
-                int hresult = Native.CreateFFBEffect(guidInstance, FFBEffects.CustomForce);
-                if (hresult != 0)
-                {
-                    DebugLog($"CreateFFBEffect Failed: 0x{hresult:x} {WinErrors.GetSystemMessage(hresult)}");
-                    return false;
-                }
-
-                // Try updating again
                 success = UpdateCustomForceNative(guidInstance, forceData, samplePeriod);
             }
             return success;
@@ -1075,9 +1117,10 @@ namespace DirectInputManager
         /// <param name="startMagnitude">Starting force [-10000, 10000]</param>
         /// <param name="endMagnitude">Ending force [-10000, 10000]</param>
         /// <returns>True if the update was successful</returns>
-        public static bool UpdateRampForceNative(string guidInstance, int startMagnitude, int endMagnitude)
+        /// <summary>Plays a ramp from startMagnitude to endMagnitude once over durationMicroseconds (a ramp cannot run forever).</summary>
+        public static bool UpdateRampForceNative(string guidInstance, int startMagnitude, int endMagnitude, uint durationMicroseconds = 1000000)
         {
-            return Check("UpdateRampForce", Native.UpdateRampForce(guidInstance, startMagnitude, endMagnitude), log: false);
+            return Check("UpdateRampForce", Native.UpdateRampForce(guidInstance, startMagnitude, endMagnitude, durationMicroseconds), log: false);
         }
 
         /// <summary>
@@ -1221,6 +1264,8 @@ namespace DirectInputManager
                 unchecked((int)0x80040208) => "DIERR_EFFECTPLAYING",
                 unchecked((int)0x80040209) => "DIERR_UNPLUGGED",
                 unchecked((int)0x8004020A) => "DIERR_REPORTFULL",
+                unchecked((int)0x8004F300) => "DIERR_NOWINDOWHANDLE (DLL could not create its hidden window)",
+                unchecked((int)0x8004F301) => "DIERR_UNITYNOTINITIALIZED (plugin load callback has not run)",
                 _ => null,
             };
             string text = name != null ? name : GetSystemMessage(hr).Trim();
@@ -1244,9 +1289,6 @@ namespace DirectInputManager
     /// Invocation: DebouncerName.Debounce(() => { Console.WriteLine("Executed"); });<br/>
     /// Source: https://stackoverflow.com/a/47933557/3055031 (Modifed)
     /// </summary>
-#if UNITY_STANDALONE_WIN
-    [DefaultExecutionOrder(-750)]
-#endif
     public class Debouncer
     {
         private List<CancellationTokenSource> CancelTokens;
@@ -1281,9 +1323,12 @@ namespace DirectInputManager
 
         private void CancelAllTokens()
         {
-            foreach (var token in CancelTokens)
+            lock (_lockThis)
             {
-                if (!token.IsCancellationRequested) { token.Cancel(); }
+                foreach (var token in CancelTokens)
+                {
+                    if (!token.IsCancellationRequested) { token.Cancel(); }
+                }
             }
         }
     }

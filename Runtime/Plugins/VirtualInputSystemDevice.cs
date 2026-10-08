@@ -221,7 +221,6 @@ public struct FlatJoyState2State : IInputStateTypeInfo
 #if UNITY_EDITOR
 [InitializeOnLoad]
 #endif
-[DefaultExecutionOrder(-740)]
 [InputControlLayout(displayName = "DirectInput Device", stateType = typeof(FlatJoyState2State))]
 public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
 {
@@ -241,7 +240,11 @@ public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
         if (isFullyDone)
             return;
         isFullyDone = false;
-        DIManager.Initialize();                                                                               // Start DirectInput if it's not already
+        if (!DIManager.Initialize())                                                                          // Start DirectInput if it's not already
+        {
+            Debug.LogWarning($"[DirectInputManager] DirectInput is unavailable: {DIManager.LastError}");
+            return;
+        }
         DIManager.EnumerateDevices();                                                                         // Scan for available devices 
                                                                                                               // await DIManager.EnumerateDevicesAsync();                                                           // Async allows to detect enumeration issues but causes issues with domain reloads as await yields and processes devices before layouts can be built
         DIManager.OnDeviceAdded += DIDeviceAdded;                                                             // Register handler for when a device is attached
@@ -255,8 +258,10 @@ public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
     {
         foreach (DeviceInfo device in DIManager.Devices)
         {
-            InputSystem.RegisterLayout<DirectInputDevice>($"DI_{device.productName}", matches:                  // Create a layout so we can uniquely address this device
-              new InputDeviceMatcher().WithProduct($"DID_{device.productName}")                                 // Interface name to match our device against
+            string layoutName = $"DI_{device.productName}";
+            if (InputSystem.LoadLayout(layoutName) != null) { continue; }                                      // Re-registering recreates every device of that layout
+            InputSystem.RegisterLayout<DirectInputDevice>(layoutName, matches:                                  // Create a layout so we can uniquely address this device
+              new InputDeviceMatcher().WithProduct($"DID_{device.productName}", supportRegex: false)            // Product names may contain regex metacharacters
             );
         }
     }
@@ -281,6 +286,11 @@ public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
     {
         base.OnRemoved();
         if (Current == this) { Current = null; }
+        if (DIManager.ActiveDevices.TryGetValue(this.description.serial, out ActiveDeviceInfo ADI))            // The ActiveDeviceInfo outlives this InputDevice
+        {
+            ADI.OnDeviceRemoved -= this.DIDeviceRemoved;
+            ADI.OnDeviceStateChange -= this.DeviceStateChanged;
+        }
     }
 
     public void OnUpdate()
@@ -380,7 +390,6 @@ public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
 #if UNITY_EDITOR
 [InitializeOnLoad]
 #endif
-[DefaultExecutionOrder(-740)]
 public class CenterAxisProcessor : InputProcessor<float>
 {
 #if UNITY_EDITOR
@@ -403,7 +412,6 @@ public class CenterAxisProcessor : InputProcessor<float>
 #if UNITY_EDITOR
 [InitializeOnLoad]
 #endif
-[DefaultExecutionOrder(-740)]
 public class SmartInvertProcessor : InputProcessor<float>
 {
 #if UNITY_EDITOR
