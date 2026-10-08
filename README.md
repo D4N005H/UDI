@@ -80,14 +80,40 @@ Regardless of installation method, **restart Unity** to ensure proper DLL loadin
 | Spring        	| ✅ |
 | Square        	| ✅ |
 | Triangle      	| ✅ |
-| CustomForce   	| ℹ️ |
+| CustomForce   	| ✅ |
 | Front Collision  	| ✅ |
 | Rear Collision   	| ✅ |
 | Left Collision  	| ✅ |
 | RightCollision  	| ✅ |
 
 [comment]: <> (✅ ℹ️ 🔲)
-Note that everything is adjustable in the native DLL. The Custom Force effect exists but has not been fully implemented, and the collision effects are only in the Unity project. This is optimized to be used in the Unity Game Engine only.
+Note that everything is adjustable in the native DLL. The collision effects are only in the Unity project. This is optimized to be used in the Unity Game Engine only.
+
+Custom Force plays a list of samples (-10000..10000 each) at a sample period in microseconds through
+`DIManager.UpdateCustomForceNative(guid, samples, samplePeriod)`; the device must enumerate
+`GUID_CustomForce` (check with `DIManager.TryGetSupportedFFBEffects`). Ramp Force plays once from
+start to end over a duration in microseconds (`UpdateRampForceNative(guid, start, end, duration)`);
+a ramp cannot run forever, so every update replays it.
+
+### Behaviour notes (read before upgrading)
+
+- Nothing energises a device on its own: attaching, enumerating, selecting or loading a profile
+  creates no effect. An effect starts only when your code (or the Explorer user) enables it, and it is
+  created at zero force. A DirectInput magnitude or gain is not a physical torque; a software stop
+  cannot guarantee a wheel stops if the driver or the device fails, so keep the wheelbase's own stop
+  within reach while testing.
+- The native sources in `src~/DirectInputForceFeedback~` are ahead of the shipped
+  `Runtime/Plugins/DLL/DirectInputForceFeedback.dll`. Rebuild the DLL (see Additional Installation
+  Info) to get hot-plug events, effect status queries, the ramp duration and the fixes listed in
+  `docs/engineering-notes.md`. With the old DLL the managed layer still works; the new queries report
+  `E_NOTIMPL` with a rebuild hint.
+- `UpdateDamperSimple`, `UpdateFrictionSimple` and `UpdateInertiaSimple` now pass full saturation
+  (10000) instead of 0, which on compliant drivers meant no force at all.
+- Effect direction is a unit vector along the first force-feedback actuator (the steering axis) on
+  every device; it used to be a diagonal on two-actuator devices.
+- `OnDeviceAdded` / `OnDeviceRemoved` fire again (they had been dead since the hook was removed in
+  March 2025). They arrive on the thread that called `DIManager.Initialize`, which must pump Windows
+  messages (Unity's main thread and the Explorer's UI thread do).
 
 ## Compatible Devices
 ### Note that all the devices that use Direct Input (from the old Logitech G wheels to the advanced Simucube ones) should work
@@ -116,15 +142,16 @@ Note for pedals, only input readings were guaranteed to *likely* work fine.
 
 ## Environment
 
-- Any Unity version that is using the .NET C# v5 should work
+- Unity 2021.2 or newer (the sources use C# 9) with the Input System package 1.0.2 or newer; 64-bit
+  Windows Editor and Standalone only (`package.json` declares `"unity": "2021.2"`).
 
 ### Windows Version Support
 The DirectInputManager should run on Windows 10 22H2 and newer (e.g., Windows 11) out of the box. The DirectInput API is available on these modern Windows versions without additional packages.
 
 ### Development Requirements
 For developers working on the project:
-- Visual Studio 2019 or newer
-- .NET 5 SDK
+- Visual Studio 2022 (v143 toolset, the DLL uses C++20)
+- .NET 5 SDK for the Explorer (.NET 5 is out of support; a newer SDK builds it with a warning)
 - Windows SDK (for DirectInput headers)
 - Microsoft Visual C++ Redistributable
 - C++ build tools if modifying the native DLL
@@ -151,7 +178,7 @@ For Unitypackage, if you do not have some SDKs installed, you may get an error s
 
 **Important Note:** This plugin was designed primarily for standard direct input wheelbases as well as steering wheels. Thus, it supports force feedback on the first/primary axis of FFB-capable devices.
 
-While the code enumerates all available FFB axes and includes them in effect definitions, the current API functions do not provide individual control over secondary axes. 
+The effect is created across every actuator the device enumerates (`DIDFT_AXIS` objects with `DIDOI_FFACTUATOR`), with a direction vector of 10000 on the first actuator and 0 on the others, and one `DICONDITION` per actuator carrying the same values. The current API functions do not provide individual control over secondary axes. 
 
 To properly support multiple FFB axes, the API would need to be extended with functions that:
 
@@ -160,6 +187,17 @@ To properly support multiple FFB axes, the API would need to be extended with fu
 * Include axis index parameters in the update functions
 
 These enhancements would enable support for devices with multiple force feedback axes, such as dual-motor joysticks or specialty controllers.
+
+# Tests and engineering notes
+
+- `src~/DirectInputManager.Tests~`: xunit tests of the managed layer (struct layouts, HRESULT handling,
+  poll change detection) that run on any OS with `dotnet test`.
+- `Tests/Editor`: the same layout checks as NUnit tests for the Unity Test Runner.
+- `src~/DirectInputForceFeedback~/tests/helpers_test.cpp`: tests of the DLL's platform-independent
+  helpers (GUID validation, axis clamping, POV to d-pad bits, direction vector); build command in the
+  file header.
+- `docs/engineering-notes.md`: findings, design decisions, measurements, verification matrix and the
+  remaining work; `docs/ledgers/`: the DirectInput, Unity and history source ledgers behind them.
 
 # Notice
 Occasionally, calls to EnumerateDevices will take orders of magnitude longer than usual to execute (up to 60 seconds). This is caused by a Windows bug attempting to load an absent hardware device. USB Audio DACs & Corsair keyboards are known to cause this issue. Try disconnecting and reconnecting the offending USB devices. For more information, see [this](https://stackoverflow.com/questions/10967795/directinput8-enumdevices-sometimes-painfully-slow) StackOverflow post about the issue from 2012. See issue [#1](https://github.com/MrTimcakes/Unity-DirectInput/issues/1) for more info.
