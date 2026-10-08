@@ -1151,6 +1151,7 @@ namespace DirectInputManager
         /// <param name="forceData">Array of force values [-10000, 10000]</param>
         /// <param name="samplePeriod">Sample period in microseconds</param>
         /// <returns>True if the update was successful</returns>
+        /// <summary>Downloads forceData (-10000..10000 each) as the custom force samples; samplePeriod is microseconds, 0 keeps the period the DLL took from DIDEVCAPS.</summary>
         public static bool UpdateCustomForceNative(string guidInstance, int[] forceData, uint samplePeriod)
         {
             if (forceData == null || forceData.Length == 0) { LastHResult = unchecked((int)0x80070057); LastError = "UpdateCustomForce: forceData must contain at least one sample"; return false; }

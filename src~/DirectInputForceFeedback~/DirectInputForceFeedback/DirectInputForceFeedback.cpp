@@ -1483,7 +1483,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateCustomForce(LPCSTR guidIns
 			int clampedForce = (forceData[i] > 10000) ? 10000 : (forceData[i] < -10000) ? -10000 : forceData[i];
 			cf->rglForceData[i] = clampedForce;
 		}
-		cf->dwSamplePeriod = samplePeriod;
+		if (samplePeriod != 0) cf->dwSamplePeriod = samplePeriod; // 0 keeps the period taken from DIDEVCAPS at creation
 		HRESULT hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::CustomForce]->SetParameters(
 			&effectConfig, DIEP_TYPESPECIFICPARAMS
 		);

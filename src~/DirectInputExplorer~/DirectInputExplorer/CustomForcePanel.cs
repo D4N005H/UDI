@@ -51,7 +51,7 @@ namespace DirectInputExplorer
             _devicePeriod = new Label { Text = "", AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(3, 8, 3, 3) };
             settings.Controls.Add(new Label { Text = "Samples:", AutoSize = true, Margin = new Padding(3, 8, 3, 3) });
             settings.Controls.Add(_sampleCount);
-            settings.Controls.Add(new Label { Text = "Sample period (microseconds, 0 = device default):", AutoSize = true, Margin = new Padding(12, 8, 3, 3) });
+            settings.Controls.Add(new Label { Text = "Sample period (microseconds, 0 = keep the period the device reported):", AutoSize = true, Margin = new Padding(12, 8, 3, 3) });
             settings.Controls.Add(_samplePeriod);
             settings.Controls.Add(_devicePeriod);
             table.Controls.Add(settings, 0, 1);
@@ -107,7 +107,7 @@ namespace DirectInputExplorer
 
         public bool IsEffectEnabled => _enable.Checked;
 
-        /// <summary>Sample period in microseconds; 0 asks the DLL to keep the device default.</summary>
+        /// <summary>Sample period in microseconds; 0 keeps the DIDEVCAPS period the DLL used when it created the effect.</summary>
         public uint SamplePeriod => (uint)_samplePeriod.Value;
 
         /// <summary>The force samples as currently edited, clamped to the DirectInput range.</summary>
