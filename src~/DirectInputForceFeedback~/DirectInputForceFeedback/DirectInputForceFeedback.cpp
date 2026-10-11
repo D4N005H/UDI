@@ -20,7 +20,7 @@ std::map<DeviceGUID, std::map<Effects::Type, LPDIRECTINPUTEFFECT>> _DeviceFFBEff
 DeviceChangeCallback g_deviceCallback = nullptr;
 std::vector<std::wstring> DEBUGDATA;
 // Managed code enumerates from a thread-pool thread while the main thread polls; one lock serialises every
-// export. Recursive so a WM_DEVICECHANGE callback that re-enters the API on the window's thread cannot deadlock.
+// export that touches DirectInput state. Recursive so a WM_DEVICECHANGE callback that re-enters the API on the window's thread cannot deadlock.
 static std::recursive_mutex g_apiLock;
 char* SafeStrDup(const char* source) {
 	if (!source) {
@@ -144,12 +144,15 @@ static void DestroyHiddenWindow() {
 	if (g_hiddenWindow) {
 		// shortcut: DestroyWindow only works on the creating thread; a StopDirectInput from another thread
 		// leaves the window until process exit, upgrade to a dedicated notification thread if a host needs that.
-		if (!DestroyWindow(g_hiddenWindow)) {
+		// The handle is kept on failure so a later restart reuses it instead of creating a second window.
+		if (DestroyWindow(g_hiddenWindow)) {
+			g_hiddenWindow = nullptr;
+			UnregisterClassW(kHiddenWindowClass, ThisModule());
+		}
+		else {
 			LogMessage("DestroyHiddenWindow: DestroyWindow failed: %lu (created on thread %lu, called from %lu)",
 				GetLastError(), g_hiddenWindowThread, GetCurrentThreadId());
 		}
-		g_hiddenWindow = nullptr;
-		UnregisterClassW(kHiddenWindowClass, ThisModule());
 	}
 }
 static HRESULT ReacquireDeviceAndEffects(const std::string& GUIDString) {
@@ -163,7 +166,8 @@ static HRESULT ReacquireDeviceAndEffects(const std::string& GUIDString) {
 	}
 	if (_DeviceFFBEffectControl.contains(GUIDString)) {
 		for (auto& [effectType, effectControl] : _DeviceFFBEffectControl[GUIDString]) {
-			if (effectControl) {
+			// A finite effect (the ramp) is not replayed: restarting a finished one-shot would surprise the user.
+			if (effectControl && _DeviceFFBEffectConfig[GUIDString][effectType].dwDuration == INFINITE) {
 				// Effects are unloaded when acquisition is lost; Start downloads and restarts them.
 				HRESULT hrStart = effectControl->Start(1, 0);
 				if (FAILED(hrStart)) {
@@ -201,6 +205,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT StopDirectInput() {
 	HRESULT hr = S_OK;
 	if (_DirectInput == nullptr) {
 		LogMessage("StopDirectInput: DirectInput already stopped");
+		DestroyHiddenWindow(); // SetDeviceChangeCallback may have created it without DirectInput running
 		return S_OK;
 	}
 	for (const auto& [GUIDString, Device] : _ActiveDevices) {
@@ -1484,15 +1489,16 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateCustomForce(LPCSTR guidIns
 			cf->rglForceData[i] = clampedForce;
 		}
 		if (samplePeriod != 0) cf->dwSamplePeriod = samplePeriod; // 0 keeps the period taken from DIDEVCAPS at creation
+		effectConfig.dwSamplePeriod = cf->dwSamplePeriod; // keep DIEFFECT and DICUSTOMFORCE periods in step
 		HRESULT hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::CustomForce]->SetParameters(
-			&effectConfig, DIEP_TYPESPECIFICPARAMS
+			&effectConfig, DIEP_TYPESPECIFICPARAMS | DIEP_SAMPLEPERIOD
 		);
 		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
 			LogMessage("UpdateCustomForce: Device lost, reacquiring");
 			hr = ReacquireDeviceAndEffects(GUIDString);
 			if (SUCCEEDED(hr)) {
 				hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::CustomForce]->SetParameters(
-					&effectConfig, DIEP_TYPESPECIFICPARAMS
+					&effectConfig, DIEP_TYPESPECIFICPARAMS | DIEP_SAMPLEPERIOD
 				);
 			}
 		}

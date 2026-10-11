@@ -74,8 +74,10 @@ parameters, then `Start(1, 0)` -> `Update*` calls `SetParameters` ->
 `DestroyFFBEffect` Stop/Unload/Release -> `DestroyDevice` -> `StopDirectInput`
 (destroys the window last).
 
-Threading contract (DESIGN DECISION): every export takes `g_apiLock`
-(recursive). The hidden window is created on the thread that first calls
+Threading contract (DESIGN DECISION): every export that touches DirectInput
+state takes `g_apiLock` (recursive); the version and initialised-flag getters
+do not. A hot-plug rescan holds the lock for the whole `EnumDevices` run, so a
+main-thread poll waits for it (moving enumeration outside the lock is open work). The hidden window is created on the thread that first calls
 `SetDeviceChangeCallback` (from `DIManager.Initialize`) or `CreateDevice`;
 device-change messages are delivered only while that thread pumps messages
 (Unity main thread, WinForms UI thread). `StopDirectInput` from another thread
@@ -208,7 +210,7 @@ Within WinForms, no new dependencies, no designer files:
 | Reflection `ValueType.Equals` (rejected) | 7595 ns | not used | same | n/a | | |
 | Per-update native logging | one `LogMessage` per successful `Update*` | removed (failures still log) | code read | unmeasured | | NOT MEASURED |
 | Layout re-registration on hot-plug | all devices recreated per event | skip registered layouts | code read | unmeasured | | NOT MEASURED |
-| Export lock | none | `recursive_mutex` per call | code read | unmeasured (uncontended lock, expected tens of ns) | | NOT MEASURED |
+| Export lock | none | `recursive_mutex` per call | code read | unmeasured (tens of ns uncontended; a poll blocks for a full `EnumDevices` during a rescan) | | NOT MEASURED |
 
 ## 7. Target, build and test matrix
 

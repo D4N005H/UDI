@@ -42,7 +42,8 @@ inline uint16_t PovToDpadBits(uint32_t pov) {
 
 // Default DIEFF_CARTESIAN direction for an effect spanning `count` actuators: a unit vector along the
 // first actuator, so the whole magnitude reaches it and the sign of the magnitude selects the side.
-// Microsoft's single-axis sample uses 0 here and DirectInput ignores the value for one axis; a non-zero
+// Microsoft's single-axis sample and SDL pass 0 here; Wine ignores the value for one axis, but no Microsoft text
+// says Windows does. A non-zero
 // first element is kept because commit 8a4e3d7 reports a wheel that misread 0 (unverified), and it is
 // equally valid. The previous "10000 on every element" was a 45 degree diagonal on two actuators.
 template <typename T>

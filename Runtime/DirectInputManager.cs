@@ -205,29 +205,34 @@ namespace DirectInputManager
             }
         }
 
+        private static readonly object _enumerateLock = new object();
+
         /// <summary>
         /// Fetch currently available devices and populate DIManager.devices<br/>
         /// </summary>
         public static void EnumerateDevices()
         {
-            IntPtr ptrDevices = Native.EnumerateDevices(out int deviceCount); // Returns pointer to list of devices and how many are available
-
-            if (deviceCount > 0)
+            // The native list stays valid only until the next EnumerateDevices call, so the read must not overlap another one.
+            lock (_enumerateLock)
             {
-                _devices = new DeviceInfo[deviceCount];
+                IntPtr ptrDevices = Native.EnumerateDevices(out int deviceCount); // Returns pointer to list of devices and how many are available
 
-                int deviceSize = Marshal.SizeOf(typeof(DeviceInfo)); // Size of each Device entry
-                for (int i = 0; i < deviceCount; i++)
+                if (deviceCount > 0)
                 {
-                    IntPtr pCurrent = ptrDevices + i * deviceSize; // Ptr to the current device
-                    _devices[i] = Marshal.PtrToStructure<DeviceInfo>(pCurrent); // Transform the Ptr into a C# instance of DeviceInfo
+                    _devices = new DeviceInfo[deviceCount];
+
+                    int deviceSize = Marshal.SizeOf(typeof(DeviceInfo)); // Size of each Device entry
+                    for (int i = 0; i < deviceCount; i++)
+                    {
+                        IntPtr pCurrent = ptrDevices + i * deviceSize; // Ptr to the current device
+                        _devices[i] = Marshal.PtrToStructure<DeviceInfo>(pCurrent); // Transform the Ptr into a C# instance of DeviceInfo
+                    }
+                }
+                else
+                {
+                    _devices = Array.Empty<DeviceInfo>(); // empty _devices when no devices are present
                 }
             }
-            else
-            {
-                _devices = Array.Empty<DeviceInfo>(); // empty _devices when no devices are present
-            }
-            return;
         }
 
         public static async Task EnumerateDevicesAsync()
