@@ -322,3 +322,157 @@ directory (the WindowsDesktop pack is missing from Ubuntu's source-built SDK);
 nothing was installed system-wide. Microsoft documentation hosts were not
 reachable; API claims rest on headers (Wine, mingw-w64), the SDL and FFConst
 sources, and search snippets, as recorded in `docs/ledgers/`.
+
+## 12. Error-reporting round (2026-10-12)
+
+Input: an adversarially verified review of 76 findings in five areas (74
+confirmed; SAMPLES-05 and SAMPLES-23 refuted and not implemented) and research
+on Windows and vendor failure modes. "VERIFIED" below means compiled, tested or
+read in this Linux container; everything that needs Windows, MSVC, Unity or a
+wheel is HYPOTHESIS.
+
+### Notification design
+
+- `DirectInputLogger.Report(severity, title, details)` logs to the Console once
+  per report (`LogError`/`LogWarning`/`Log`, prefix `[DirectInput]`) and, in
+  Play Mode, queues an IMGUI card for the top-right of the Game view. Callable
+  from any thread; cards are drained on the main thread.
+- On by default: `DirectInputLogger.Enabled` (`DIManager.showLogsRuntime` maps
+  to it). `DIRECTINPUT_DISABLE_TOASTS` compiles the drawing out. Console
+  logging stays in both cases.
+- Card: title; Show details (operation, device name, GUID, VID:PID, HRESULT
+  name and meaning, the DLL's last error, what to do); Copy; repeats merged
+  with a count; fades after 6/12/20 s of unscaled time (info/warning/error),
+  kept while hovered or expanded; at most 20 stored and 5 shown.
+- Rate: a per-frame call reports once per change of (operation, device, effect,
+  HRESULT) and once when it works again; repeats only refresh `LastError`.
+- Edit mode: `Editor/PluginSelfCheck.cs` reports a plugin that cannot load once,
+  with the DLL asset as Console context.
+- DESIGN DECISION: IMGUI needs no package, EventSystem, input backend or render
+  pipeline. A quiet card area never means force feedback works.
+
+### Coverage
+
+| Class | Case | Signal |
+|-------|------|--------|
+| Deterministic | DLL cannot load: non-Windows or Arm64 Editor, DLL missing, dependency missing (VC++ runtime, `dinput8.dll`), wrong architecture, DLL older than the scripts | exception type, `LoadLibraryExW` error 126/193 plus per-dependency probe, missing export |
+| Deterministic | DirectInput does not start (including `DIERR_UNITYNOTINITIALIZED`) | `StartDirectInput` HRESULT |
+| Deterministic | Enumeration failed, as opposed to no controller found | `deviceCount` -1 vs 0 (needs the rebuilt DLL) |
+| Deterministic | Another program holds the device exclusively | `E_ACCESSDENIED` / `DIERR_OTHERAPPHASPRIO` |
+| Deterministic | Device lost, unplugged or reconnected | HRESULT, hot-plug callback |
+| Deterministic | Effect create/update fails: device full, unsupported, incomplete, not exclusively acquired, playing, not downloaded, invalid parameters | HRESULT |
+| Deterministic (warning) | Call succeeded but the force is not what was asked: `DI_DOWNLOADSKIPPED`, `DI_TRUNCATED`, `DI_TRUNCATEDANDRESTARTED` | success codes 3, 8, 0xC |
+| Deterministic (raw) | Driver-defined `0x800403xx` and HID `0xC011xxxx` codes: shown, meaning not guessed | HRESULT range |
+| Heuristic | A wheel (driving type, or joystick/flight from a wheel vendor) that enumerates without force feedback: hint by USB VID (Logitech, Thrustmaster, Fanatec, Moza, Cammus, Asetek) naming vendor driver/software or console mode as likely causes | `FFBCapable`, `guidProduct` |
+| Heuristic | `E_FAIL` described with its possible causes | HRESULT |
+| Not detectable | Force-feedback strength 0 or off in vendor software, overheat, safety or torque modes, emergency stop, an FFB switch on the wheel, Steam Input | every call succeeds |
+| Not detectable | Which program holds the wheel; why no controller is visible (power, hub, filter drivers) | |
+| Not detectable | A crash inside the DLL; whether a software stop physically stopped the motor | |
+
+Vendor-software requirements and the vendor hint texts are UNVERIFIED (vendor
+sites were unreachable), so the hints say "likely causes", never a diagnosis.
+
+### Fixes by finding id
+
+VERIFIED by reading the diff; runtime behaviour is HYPOTHESIS.
+
+- Native: NATIVE-1 (Poll before reads), NATIVE-2 (Update* return the
+  SetParameters HRESULT including success codes; `DI_DOWNLOADSKIPPED` gets one
+  reacquire), NATIVE-3 (a failed effect restart is returned), NATIVE-4
+  (lost-device logging once per transition), NATIVE-7 (Fanatec duplicate
+  probe), NATIVE-8 (DEBUG1 prints hex). NATIVE-6 partial: a failed second pass
+  no longer returns no devices; the pass stays, with a `shortcut:` comment.
+  NATIVE-5 not changed (severity none). vcxproj: static CRT in all four
+  configurations. Review fix: a read error is returned unless Acquire failed in
+  the same call.
+- Managed and logger: MANAGED-01 to 11 and LOGGER-AND-ERRORS-01 to 18.
+  LOGGER-10 is partial: a missing export is reported, `GetPluginVersion` is not
+  compared. Review fixes: no per-frame report flood from the samples'
+  Enable/Destroy loop; only DLL-load exceptions get the load probe; edit-mode
+  enumeration notes suppressed; `[Out]` on the `GetDILastError` buffer.
+- Explorer: EXPLORER-1, 3 to 8, 10 and 12. EXPLORER-9 shows the autocenter box
+  as unknown until the user sets it. EXPLORER-2 and 11 through DIManager, plus
+  the Explorer side of 11.
+- Samples: SAMPLES-01 (namespaces; GUIDs unchanged), 02 to 04, 06 to 17, 19 to
+  22, 24 to 27. SAMPLES-18 not done: restoring saved enable states at launch
+  would start effects. Review fixes: collision jolt runs on real time; a
+  disabled NWH provider cannot jolt; UGUI launch stops all effects; Load
+  reconnects before applying; `*WasEnabled` flags reset when effects are
+  destroyed.
+- Integration fixes in the final pass:
+  - The 1.0.2 UGUI sample merged into `directinput.unity` through an asmref,
+    and that assembly does not reference `UnityEngine.UI`, so the sample never
+    compiled (27 errors). It now has its own asmdef `DirectInputSamples.UGUI`
+    (references `directinput.unity`, `Unity.InputSystem`, `UnityEngine.UI`;
+    Editor and WindowsStandalone64; new GUID
+    `e4935e0ac25c43d08932e94158cf0758`). This also drops the asmref GUID the
+    UGUI package shared with the 1.0.1 packages.
+  - The managed side treated `deviceCount < 0` as "could not be listed, keep the
+    list" (MANAGED-07), but native `EnumerateDevices` returned 0 on failure, so
+    a failed scan read as "no devices" and a hot-plug rescan detached every
+    device. Native now returns -1 on every failure path.
+
+### Still open
+
+1. The checked-in `Runtime/Plugins/DLL/DirectInputForceFeedback.dll` was NOT
+   rebuilt. VERIFIED with objdump: it exports 30 functions (no
+   `GetFFBEffectStatus`, no `GetSupportedFFBEffects`) and imports `MSVCP140`,
+   `VCRUNTIME140`, `VCRUNTIME140_1` and `api-ms-win-crt-*` (dynamic CRT). Until
+   it is rebuilt on Windows (VS2022, Release x64, /MT), none of the native
+   fixes reach users; the managed side reports the old DLL once.
+2. Update* can return 3, 4, 8 or 12 on success. The public wrappers return
+   bool (`hr >= 0`), but `DIManager.LastHResult` can hold those values, so user
+   code testing `LastHResult == 0` must test `>= 0`.
+3. Explorer: after a failed enumeration (rebuilt DLL) it keeps the previous
+   list and logs "Enumerated N device(s)"; the failure only reaches
+   `Debug.WriteLine`.
+4. NATIVE-6 second pass; one Acquire per call per frame while a device stays
+   unacquirable; a failed restart on the poll path leaves that effect stopped
+   until the next reacquire.
+5. Sample GUID collisions across packages (kept by rule): `DIInputManager.cs`
+   in all three; `DIInputValueMonitor.cs`, `RuntimeFFBConfigUI.cs`,
+   `RuntimeInputMappingUI.cs` and `directinput.asmref` in the two 1.0.1
+   packages; the sample root, `Scripts` and `Scene` folders in all three.
+   HYPOTHESIS: importing the NWH package and then the Fundamental one can
+   overwrite the NWH copies (other namespace) and break `NWHFFB`.
+6. NWH Vehicle Physics 2 itself needs Input System 1.1 or later (VERIFIED by
+   compiling it), so the NWH sample cannot run on the declared minimum 1.0.2.
+   The UGUI sample needs `com.unity.ugui` in the project, as it always did.
+7. Hardware: the section 9 checks, plus each card on a real failure,
+   `DI_DOWNLOADSKIPPED`/`DI_TRUNCATED` on a real wheel, and the load-failure
+   classification on a Windows machine without the VC++ runtime.
+
+### Verification results
+
+VERIFIED, run here after the last edit:
+
+- `dotnet test src~/DirectInputManager.Tests~`: `Passed! - Failed: 0, Passed:
+  31, Skipped: 0, Total: 31`.
+- `dotnet build src~/DirectInputExplorer~/DirectInputExplorer
+  -p:EnableWindowsTargeting=true --no-incremental`: Build succeeded, 0
+  Error(s), 3 Warning(s) (NETSDK1138, net5.0 end of life).
+- `clang++` and `g++ -std=c++20 -Wall -Wextra -IDirectInputForceFeedback
+  tests/helpers_test.cpp`: `all helper tests passed` with both.
+- MinGW-w64 `x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra`
+  with scratch stubs for `atlbase.h`/`atlsafe.h`: DirectInputForceFeedback.cpp
+  0 errors, 25 warnings (the same 16 distinct messages as before the round);
+  dllmain.cpp 0 errors, 2 warnings; pch.cpp 0/0. `-shared -static` link OK;
+  32 exports, identical to the pre-round build.
+- Unity compile harness (Roslyn, C# 9, .NET Standard 2.1, UnityEngine 2021.3.33
+  and UnityEditor 2021.1.14 reference DLLs, Input System 1.0.2 and uGUI built
+  from source): Runtime and Editor, PLAYER and EDITOR, 0 errors (2 CS0618
+  SafeArray warnings). With the samples extracted from the current `Samples~`
+  packages, each sample set alone and all together, PLAYER and EDITOR: 0
+  errors (NWHFFB: 3 CS0414 warnings). Exit code 0.
+- The same assemblies with `UNITY_2023_1_OR_NEWER` defined: 0 errors.
+  `Tests/Editor` against an NUnit stub: 0 errors.
+- `.meta`: present for every file and folder under Runtime, Editor and Tests;
+  no orphans; 20 GUIDs, no duplicates; no sample GUID equals a repo GUID.
+- P/Invoke: the 28 managed declarations (27 entry points) all name exports of
+  the source build with matching parameter types. Success codes count as
+  success (`hr >= 0`); 3, 8 and 12 are reported once as "only partly applied".
+
+HYPOTHESIS: the MSVC /MT build; every runtime behaviour above; card rendering;
+Unity importing the repacked `.unitypackage` and its new asmdef; the harness's
+known false positives and negatives (UnityEditor 2021.1 surface, uGUI 2018.4
+source, player-flavour engine DLLs).
