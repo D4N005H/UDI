@@ -7,6 +7,7 @@
 #include <strsafe.h>
 #include <dbt.h>
 #include <mutex>
+#include <set>
 LPDIRECTINPUT8 _DirectInput = nullptr;
 bool g_UnityInitialized = false;
 std::string g_LastErrorMessage;
@@ -155,15 +156,25 @@ static void DestroyHiddenWindow() {
 		}
 	}
 }
+// Devices whose last Acquire failed: a loss that lasts is logged once per transition, not every frame.
+static std::set<DeviceGUID> _LostDevices;
+// Returns the Acquire failure, else the first failed effect restart, so an effect that stayed off is not reported as S_OK.
 static HRESULT ReacquireDeviceAndEffects(const std::string& GUIDString) {
 	if (!_ActiveDevices.contains(GUIDString)) {
 		return E_FAIL;
 	}
 	HRESULT hr = _ActiveDevices[GUIDString]->Acquire();
 	if (FAILED(hr)) {
-		LogMessage("ReacquireDeviceAndEffects: Failed to reacquire device: 0x%08X", hr);
+		if (_LostDevices.insert(GUIDString).second) {
+			LogMessage("ReacquireDeviceAndEffects: Failed to reacquire device %s: 0x%08X (logged again only after it recovers)", GUIDString.c_str(), hr);
+		}
 		return hr;
 	}
+	_LostDevices.erase(GUIDString);
+	if (hr == DI_NOEFFECT) {
+		return S_OK; // already acquired: nothing was unloaded, and Start would rewind effects that are running
+	}
+	HRESULT hrFirstStartFailure = S_OK;
 	if (_DeviceFFBEffectControl.contains(GUIDString)) {
 		for (auto& [effectType, effectControl] : _DeviceFFBEffectControl[GUIDString]) {
 			// A finite effect (the ramp) is not replayed: restarting a finished one-shot would surprise the user.
@@ -172,12 +183,55 @@ static HRESULT ReacquireDeviceAndEffects(const std::string& GUIDString) {
 				HRESULT hrStart = effectControl->Start(1, 0);
 				if (FAILED(hrStart)) {
 					LogMessage("ReacquireDeviceAndEffects: Failed to restart effect %d: 0x%08X", static_cast<int>(effectType), hrStart);
+					if (SUCCEEDED(hrFirstStartFailure)) hrFirstStartFailure = hrStart;
 				}
 			}
 		}
 	}
-	LogMessage("ReacquireDeviceAndEffects: Device and effects reacquired successfully");
-	return S_OK;
+	if (SUCCEEDED(hrFirstStartFailure)) {
+		LogMessage("ReacquireDeviceAndEffects: Device and effects reacquired successfully");
+	}
+	return hrFirstStartFailure;
+}
+// Shared by GetDeviceState/GetDeviceStateRaw. Polled devices only refresh on Poll; the others return DI_NOEFFECT,
+// and a lost device also fails GetDeviceState, so Poll's result is not checked.
+static HRESULT ReadDeviceState(const char* caller, const std::string& GUIDString, DIJOYSTATE2& state) {
+	LPDIRECTINPUTDEVICE8 device = _ActiveDevices[GUIDString];
+	device->Poll();
+	HRESULT hr = device->GetDeviceState(sizeof(DIJOYSTATE2), &state);
+	if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
+		// Restarts the effects the loss unloaded. A failed restart is logged there and must not cost this input frame.
+		HRESULT hrReacquire = ReacquireDeviceAndEffects(GUIDString);
+		device->Poll();
+		hr = device->GetDeviceState(sizeof(DIJOYSTATE2), &state);
+		if (FAILED(hr) && _LostDevices.contains(GUIDString)) { // Acquire failed; a failed restart alone falls through to the read error
+			SetLastErrorMessage("Failed to reacquire device"); // logged once per loss by ReacquireDeviceAndEffects
+			return hrReacquire;
+		}
+	}
+	if (FAILED(hr)) {
+		LogMessage("%s: Failed to get device state: 0x%08X", caller, hr);
+		SetLastErrorMessage("Failed to get device state");
+	}
+	return hr;
+}
+// Shared by the Update* exports: reacquires and retries once when the device lost (exclusive) acquisition. Without exclusive
+// acquisition SetParameters keeps the values but returns DI_DOWNLOADSKIPPED, a success code, so that counts as a loss too.
+// Returns the real HRESULT, success codes included, so the caller can see a force that did not reach the device.
+static HRESULT SetEffectParameters(const char* caller, const std::string& GUIDString, Effects::Type effectType, DWORD flags) {
+	LPDIRECTINPUTEFFECT effect = _DeviceFFBEffectControl[GUIDString][effectType];
+	DIEFFECT& effectConfig = _DeviceFFBEffectConfig[GUIDString][effectType];
+	HRESULT hr = effect->SetParameters(&effectConfig, flags);
+	if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED || hr == static_cast<HRESULT>(DIERR_NOTEXCLUSIVEACQUIRED) || hr == DI_DOWNLOADSKIPPED) {
+		hr = ReacquireDeviceAndEffects(GUIDString);
+		if (SUCCEEDED(hr)) {
+			hr = effect->SetParameters(&effectConfig, flags);
+		}
+	}
+	if (FAILED(hr) && !_LostDevices.contains(GUIDString)) { // a failed Acquire was already logged once
+		LogMessage("%s: Failed to update effect parameters: 0x%08X", caller, hr);
+	}
+	return hr; // no per-call log on success: this runs once per effect per frame
 }
 DIRECTINPUTFORCEFEEDBACK_API HRESULT StartDirectInput() {
 	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
@@ -233,6 +287,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT StopDirectInput() {
 	_DeviceFFBAxes.clear();
 	_DeviceFFBEffectConfig.clear();
 	_DeviceFFBEffectControl.clear();
+	_LostDevices.clear();
 	DestroyHiddenWindow(); // after every device released: the window must outlive the acquisitions
 	if (_DirectInput) {
 		_DirectInput->Release();
@@ -249,6 +304,7 @@ DIRECTINPUTFORCEFEEDBACK_API DeviceInfo* EnumerateDevices(int& deviceCount) {
 		if (_DirectInput == nullptr) {
 			LogMessage("EnumerateDevices: DirectInput not initialized");
 			SetLastErrorMessage("DirectInput not initialized");
+			deviceCount = -1;
 			return nullptr;
 		}
 		for (auto& device : _DeviceInstances) {
@@ -267,8 +323,11 @@ DIRECTINPUTFORCEFEEDBACK_API DeviceInfo* EnumerateDevices(int& deviceCount) {
 		if (FAILED(hr)) {
 			LogMessage("EnumerateDevices: Failed to enumerate devices: 0x%08X", hr);
 			SetLastErrorMessage("Failed to enumerate devices");
+			deviceCount = -1;
 			return nullptr;
 		}
+		// shortcut: a second full pass under g_apiLock just for FFBCapable; guidFFDriver != GUID_NULL in the first pass is
+		// the same filter under Wine, switch once one FFB wheel and one non-FFB device confirm it on Windows.
 		hr = _DirectInput->EnumDevices(
 			DI8DEVCLASS_GAMECTRL,
 			_EnumDevicesCallbackFFB,
@@ -276,9 +335,9 @@ DIRECTINPUTFORCEFEEDBACK_API DeviceInfo* EnumerateDevices(int& deviceCount) {
 			DIEDFL_ATTACHEDONLY | DIEDFL_FORCEFEEDBACK
 		);
 		if (FAILED(hr)) {
-			LogMessage("EnumerateDevices: Failed to enumerate FFB devices: 0x%08X", hr);
+			// Not fatal: returning no devices here would make the managed rescan detach every attached device.
+			LogMessage("EnumerateDevices: Failed to enumerate FFB devices, FFBCapable may be false: 0x%08X", hr);
 			SetLastErrorMessage("Failed to enumerate FFB devices");
-			return nullptr;
 		}
 		if (!_DeviceInstances.empty()) {
 			deviceCount = static_cast<int>(_DeviceInstances.size());
@@ -293,13 +352,13 @@ DIRECTINPUTFORCEFEEDBACK_API DeviceInfo* EnumerateDevices(int& deviceCount) {
 	catch (const std::exception& e) {
 		LogMessage("EnumerateDevices: Exception: %s", e.what());
 		SetLastErrorMessage(e.what());
-		deviceCount = 0;
+		deviceCount = -1;
 		return nullptr;
 	}
 	catch (...) {
 		LogMessage("EnumerateDevices: Unknown exception");
 		SetLastErrorMessage("Unknown exception in EnumerateDevices");
-		deviceCount = 0;
+		deviceCount = -1;
 		return nullptr;
 	}
 }
@@ -415,6 +474,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyDevice(LPCSTR guidInstance) {
 		_ActiveDevices.erase(GUIDString);
 		_DeviceFFBAxes.erase(GUIDString);
 		_DeviceEnumeratedEffects.erase(GUIDString);
+		_LostDevices.erase(GUIDString);
 		LogMessage("DestroyDevice: Device destroyed successfully");
 		return S_OK;
 	}
@@ -449,20 +509,8 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceState(LPCSTR guidInstance, FlatJoy
 			return E_FAIL;
 		}
 		DIJOYSTATE2 DeviceStateRaw = {};
-		HRESULT hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &DeviceStateRaw);
-		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
-			LogMessage("GetDeviceState: Device input lost, reacquiring");
-			hr = ReacquireDeviceAndEffects(GUIDString); // restarts the effects the loss unloaded
-			if (FAILED(hr)) {
-				LogMessage("GetDeviceState: Failed to reacquire device: 0x%08X", hr);
-				SetLastErrorMessage("Failed to reacquire device");
-				return hr;
-			}
-			hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &DeviceStateRaw);
-		}
+		HRESULT hr = ReadDeviceState("GetDeviceState", GUIDString, DeviceStateRaw);
 		if (FAILED(hr)) {
-			LogMessage("GetDeviceState: Failed to get device state: 0x%08X", hr);
-			SetLastErrorMessage("Failed to get device state");
 			return hr;
 		}
 		deviceState = FlattenDIJOYSTATE2(DeviceStateRaw);
@@ -498,20 +546,8 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDeviceStateRaw(LPCSTR guidInstance, DIJO
 			SetLastErrorMessage("Device not found");
 			return E_FAIL;
 		}
-		HRESULT hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &deviceState);
-		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
-			LogMessage("GetDeviceStateRaw: Device input lost, reacquiring");
-			hr = ReacquireDeviceAndEffects(GUIDString); // restarts the effects the loss unloaded
-			if (FAILED(hr)) {
-				LogMessage("GetDeviceStateRaw: Failed to reacquire device: 0x%08X", hr);
-				SetLastErrorMessage("Failed to reacquire device");
-				return hr;
-			}
-			hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &deviceState);
-		}
+		HRESULT hr = ReadDeviceState("GetDeviceStateRaw", GUIDString, deviceState);
 		if (FAILED(hr)) {
-			LogMessage("GetDeviceStateRaw: Failed to get device state: 0x%08X", hr);
-			SetLastErrorMessage("Failed to get device state");
 			return hr;
 		}
 		return S_OK;
@@ -1210,23 +1246,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConstantForce(LPCSTR guidI
 		}
 		int clamped = (magnitude > 10000) ? 10000 : (magnitude < -10000) ? -10000 : magnitude;
 		cf->lMagnitude = clamped;
-		HRESULT hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::ConstantForce]->SetParameters(
-			&effectConfig, DIEP_TYPESPECIFICPARAMS
-		);
-		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
-			LogMessage("UpdateConstantForce: Device lost, reacquiring");
-			hr = ReacquireDeviceAndEffects(GUIDString);
-			if (SUCCEEDED(hr)) {
-				hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::ConstantForce]->SetParameters(
-					&effectConfig, DIEP_TYPESPECIFICPARAMS
-				);
-			}
-		}
-		if (FAILED(hr)) {
-			LogMessage("UpdateConstantForce: Failed to update effect parameters: 0x%08X", hr);
-			return hr;
-		}
-		return S_OK; // no per-call log: this runs once per effect per frame
+		return SetEffectParameters("UpdateConstantForce", GUIDString, Effects::Type::ConstantForce, DIEP_TYPESPECIFICPARAMS);
 	}
 	catch (const std::exception& e) {
 		LogMessage("UpdateConstantForce: Exception: %s", e.what());
@@ -1278,23 +1298,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdatePeriodicForce(LPCSTR guidI
 		pe->dwMagnitude = clampedMagnitude;
 		pe->lOffset = clampedOffset;
 		pe->dwPeriod = period;
-		HRESULT hr = _DeviceFFBEffectControl[GUIDString][effectType]->SetParameters(
-			&effectConfig, DIEP_TYPESPECIFICPARAMS
-		);
-		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
-			LogMessage("UpdatePeriodicForce: Device lost, reacquiring");
-			hr = ReacquireDeviceAndEffects(GUIDString);
-			if (SUCCEEDED(hr)) {
-				hr = _DeviceFFBEffectControl[GUIDString][effectType]->SetParameters(
-					&effectConfig, DIEP_TYPESPECIFICPARAMS
-				);
-			}
-		}
-		if (FAILED(hr)) {
-			LogMessage("UpdatePeriodicForce: Failed to update effect parameters: 0x%08X", hr);
-			return hr;
-		}
-		return S_OK;
+		return SetEffectParameters("UpdatePeriodicForce", GUIDString, effectType, DIEP_TYPESPECIFICPARAMS);
 	}
 	catch (const std::exception& e) {
 		LogMessage("UpdatePeriodicForce: Exception: %s", e.what());
@@ -1342,23 +1346,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateRampForce(LPCSTR guidInsta
 		effectConfig.dwDuration = durationMicroseconds;
 		rf->lStart = clampedStart;
 		rf->lEnd = clampedEnd;
-		HRESULT hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::RampForce]->SetParameters(
-			&effectConfig, DIEP_TYPESPECIFICPARAMS | DIEP_DURATION | DIEP_START
-		);
-		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
-			LogMessage("UpdateRampForce: Device lost, reacquiring");
-			hr = ReacquireDeviceAndEffects(GUIDString);
-			if (SUCCEEDED(hr)) {
-				hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::RampForce]->SetParameters(
-					&effectConfig, DIEP_TYPESPECIFICPARAMS | DIEP_DURATION | DIEP_START
-				);
-			}
-		}
-		if (FAILED(hr)) {
-			LogMessage("UpdateRampForce: Failed to update effect parameters: 0x%08X", hr);
-			return hr;
-		}
-		return S_OK;
+		return SetEffectParameters("UpdateRampForce", GUIDString, Effects::Type::RampForce, DIEP_TYPESPECIFICPARAMS | DIEP_DURATION | DIEP_START);
 	}
 	catch (const std::exception& e) {
 		LogMessage("UpdateRampForce: Exception: %s", e.what());
@@ -1421,23 +1409,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConditionForce(LPCSTR guid
 			cond[i].dwNegativeSaturation = clampedNegSat;
 			cond[i].lDeadBand = clampedDeadBand;
 		}
-		HRESULT hr = _DeviceFFBEffectControl[GUIDString][effectType]->SetParameters(
-			&effectConfig, DIEP_TYPESPECIFICPARAMS
-		);
-		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
-			LogMessage("UpdateConditionForce: Device lost, reacquiring");
-			hr = ReacquireDeviceAndEffects(GUIDString);
-			if (SUCCEEDED(hr)) {
-				hr = _DeviceFFBEffectControl[GUIDString][effectType]->SetParameters(
-					&effectConfig, DIEP_TYPESPECIFICPARAMS
-				);
-			}
-		}
-		if (FAILED(hr)) {
-			LogMessage("UpdateConditionForce: Failed to update effect parameters: 0x%08X", hr);
-			return hr;
-		}
-		return S_OK;
+		return SetEffectParameters("UpdateConditionForce", GUIDString, effectType, DIEP_TYPESPECIFICPARAMS);
 	}
 	catch (const std::exception& e) {
 		LogMessage("UpdateConditionForce: Exception: %s", e.what());
@@ -1490,23 +1462,7 @@ extern "C" DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateCustomForce(LPCSTR guidIns
 		}
 		if (samplePeriod != 0) cf->dwSamplePeriod = samplePeriod; // 0 keeps the period taken from DIDEVCAPS at creation
 		effectConfig.dwSamplePeriod = cf->dwSamplePeriod; // keep DIEFFECT and DICUSTOMFORCE periods in step
-		HRESULT hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::CustomForce]->SetParameters(
-			&effectConfig, DIEP_TYPESPECIFICPARAMS | DIEP_SAMPLEPERIOD
-		);
-		if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
-			LogMessage("UpdateCustomForce: Device lost, reacquiring");
-			hr = ReacquireDeviceAndEffects(GUIDString);
-			if (SUCCEEDED(hr)) {
-				hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::CustomForce]->SetParameters(
-					&effectConfig, DIEP_TYPESPECIFICPARAMS | DIEP_SAMPLEPERIOD
-				);
-			}
-		}
-		if (FAILED(hr)) {
-			LogMessage("UpdateCustomForce: Failed to update effect parameters: 0x%08X", hr);
-			return hr;
-		}
-		return S_OK;
+		return SetEffectParameters("UpdateCustomForce", GUIDString, Effects::Type::CustomForce, DIEP_TYPESPECIFICPARAMS | DIEP_SAMPLEPERIOD);
 	}
 	catch (const std::exception& e) {
 		LogMessage("UpdateCustomForce: Exception: %s", e.what());
@@ -1608,6 +1564,12 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT GetDILastError(char* buffer, int bufferSize
 	}
 	return S_OK;
 }
+// HRESULTs and type codes as 0x%08X; std::to_wstring printed them as signed decimal.
+static std::wstring HexString(DWORD value) {
+	wchar_t buffer[11];
+	swprintf_s(buffer, L"0x%08lX", static_cast<unsigned long>(value));
+	return buffer;
+}
 DIRECTINPUTFORCEFEEDBACK_API HRESULT DEBUG1(LPCSTR guidInstance, SAFEARRAY** DebugData) {
 	std::lock_guard<std::recursive_mutex> apiLock(g_apiLock);
 	try {
@@ -1646,18 +1608,18 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DEBUG1(LPCSTR guidInstance, SAFEARRAY** Deb
 		if (SUCCEEDED(hr)) {
 			debugInfo.push_back(L"  - Product Name: " + std::wstring(deviceInstance.tszProductName));
 			debugInfo.push_back(L"  - Instance Name: " + std::wstring(deviceInstance.tszInstanceName));
-			debugInfo.push_back(L"  - Device Type: 0x" + std::to_wstring(LOWORD(deviceInstance.dwDevType)));
-			debugInfo.push_back(L"  - Device Subtype: 0x" + std::to_wstring(HIWORD(deviceInstance.dwDevType)));
+			debugInfo.push_back(L"  - Device Type: " + HexString(GET_DIDEVICE_TYPE(deviceInstance.dwDevType)));
+			debugInfo.push_back(L"  - Device Subtype: " + HexString(GET_DIDEVICE_SUBTYPE(deviceInstance.dwDevType)));
 		}
 		else {
-			debugInfo.push_back(L"  - Failed to get device information: 0x" + std::to_wstring(hr));
+			debugInfo.push_back(L"  - Failed to get device information: " + HexString(hr));
 		}
 		DIDEVCAPS deviceCaps = {};
 		deviceCaps.dwSize = sizeof(DIDEVCAPS);
 		hr = _ActiveDevices[GUIDString]->GetCapabilities(&deviceCaps);
 		if (SUCCEEDED(hr)) {
 			debugInfo.push_back(L"Device Capabilities:");
-			debugInfo.push_back(L"  - Type: 0x" + std::to_wstring(deviceCaps.dwDevType));
+			debugInfo.push_back(L"  - Type: " + HexString(deviceCaps.dwDevType));
 			debugInfo.push_back(L"  - Axes: " + std::to_wstring(deviceCaps.dwAxes));
 			debugInfo.push_back(L"  - Buttons: " + std::to_wstring(deviceCaps.dwButtons));
 			debugInfo.push_back(L"  - POVs: " + std::to_wstring(deviceCaps.dwPOVs));
@@ -1667,7 +1629,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DEBUG1(LPCSTR guidInstance, SAFEARRAY** Deb
 			debugInfo.push_back(L"  - Force Feedback: " + std::wstring(isFFB ? L"Available" : L"Not Available"));
 		}
 		else {
-			debugInfo.push_back(L"ERROR: Failed to get device capabilities - 0x" + std::to_wstring(hr));
+			debugInfo.push_back(L"ERROR: Failed to get device capabilities - " + HexString(hr));
 		}
 		debugInfo.push_back(L"Force Feedback Axes:");
 		if (!_DeviceFFBAxes.contains(GUIDString)) {
@@ -1712,7 +1674,7 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DEBUG1(LPCSTR guidInstance, SAFEARRAY** Deb
 				hr = _DeviceFFBEffectControl[GUIDString][Effects::Type::ConstantForce]->GetEffectStatus(&effectStatus);
 				debugInfo.push_back(L"    - Status: " + (SUCCEEDED(hr)
 					? std::wstring((effectStatus & DIEGES_PLAYING) ? L"playing" : L"not playing")
-					: L"unknown (0x" + std::to_wstring(hr) + L")"));
+					: L"unknown (" + HexString(hr) + L")"));
 			}
 			else {
 				debugInfo.push_back(L"  - Constant Force effect is not active");
@@ -1739,12 +1701,12 @@ DIRECTINPUTFORCEFEEDBACK_API HRESULT DEBUG1(LPCSTR guidInstance, SAFEARRAY** Deb
 				}
 			}
 			else {
-				debugInfo.push_back(L"  - Failed to get device path - 0x" + std::to_wstring(hr));
+				debugInfo.push_back(L"  - Failed to get device path - " + HexString(hr));
 			}
 			DIDevice->Release();
 		}
 		else {
-			debugInfo.push_back(L"  - Failed to create temporary device - 0x" + std::to_wstring(hr));
+			debugInfo.push_back(L"  - Failed to create temporary device - " + HexString(hr));
 		}
 		DEBUGDATA.clear();
 		for (const auto& line : debugInfo) {
@@ -2137,11 +2099,12 @@ bool IsDuplicateHID(const DIDEVICEINSTANCE* DIDI) {
 		LogMessage("IsDuplicateHID: Invalid device instance (null)");
 		return true;
 	}
+	// A failed probe keeps the device: listing a possible duplicate beats hiding the real wheel.
 	HRESULT hr;
 	LPDIRECTINPUTDEVICE8 DIDevice = nullptr;
 	if (FAILED(hr = _DirectInput->CreateDevice(DIDI->guidInstance, &DIDevice, NULL))) {
-		LogMessage("IsDuplicateHID: Failed to create device: 0x%08X", hr);
-		return true;
+		LogMessage("IsDuplicateHID: Failed to create device, keeping it: 0x%08X", hr);
+		return false;
 	}
 	DIPROPGUIDANDPATH GUIDPath = {};
 	GUIDPath.diph.dwSize = sizeof(DIPROPGUIDANDPATH);
@@ -2149,9 +2112,9 @@ bool IsDuplicateHID(const DIDEVICEINSTANCE* DIDI) {
 	GUIDPath.diph.dwObj = 0;
 	GUIDPath.diph.dwHow = DIPH_DEVICE;
 	if (FAILED(hr = DIDevice->GetProperty(DIPROP_GUIDANDPATH, &GUIDPath.diph))) {
-		LogMessage("IsDuplicateHID: Failed to get device path: 0x%08X", hr);
+		LogMessage("IsDuplicateHID: Failed to get device path, keeping it: 0x%08X", hr);
 		DIDevice->Release();
-		return true;
+		return false;
 	}
 	DIDevice->Release();
 	if (wcsstr(GUIDPath.wszPath, L"&col02") != 0) {

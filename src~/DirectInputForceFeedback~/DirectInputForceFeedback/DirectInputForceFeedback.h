@@ -107,6 +107,7 @@ extern "C" { // Everything to be made available by the DLL
 	//////////////////////////////////////////////////////////////
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT StartDirectInput();
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT StopDirectInput();
+	// deviceCount is -1 when the enumeration failed (the managed side then keeps its previous list), 0 when no device is attached.
 	DIRECTINPUTFORCEFEEDBACK_API DeviceInfo* EnumerateDevices(/*[out]*/ int& deviceCount);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateDevice(LPCSTR guidInstance);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyDevice(LPCSTR guidInstance);
@@ -120,6 +121,7 @@ extern "C" { // Everything to be made available by the DLL
 
 	DIRECTINPUTFORCEFEEDBACK_API void FreeStringArray(const char** strings, int count);
 
+	// Also fails with the first failed effect restart after reacquiring (it used to report S_OK for that).
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT SetAutocenter(LPCSTR guidInstance, bool AutocenterState);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT CreateFFBEffect(LPCSTR guidInstance, Effects::Type effectType);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effects::Type effectType);
@@ -128,6 +130,10 @@ extern "C" { // Everything to be made available by the DLL
 	// *mask bit n is set when the device enumerates the standard effect with Effects::Type value n (vendor effects are ignored).
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT GetSupportedFFBEffects(LPCSTR guidInstance, /*[out]*/ DWORD* mask);
 
+	// Update* return the SetParameters HRESULT, success codes included (they used to collapse to S_OK): DI_DOWNLOADSKIPPED (3)
+	// = stored but not sent, the device stayed without exclusive acquisition after one reacquire; DI_EFFECTRESTARTED (4);
+	// DI_TRUNCATED (8) = clipped by the device; DI_TRUNCATEDANDRESTARTED (12). Test with SUCCEEDED / hr >= 0, never hr == S_OK. A lost device is
+	// reacquired and the call retried once; a failed effect restart during that reacquire is returned as the error.
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateConstantForce(LPCSTR guidInstance, int magnitude);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdatePeriodicForce(LPCSTR guidInstance, Effects::Type effectType, int magnitude, DWORD period, int offset);
 	DIRECTINPUTFORCEFEEDBACK_API HRESULT UpdateRampForce(LPCSTR guidInstance, int startMagnitude, int endMagnitude, DWORD durationMicroseconds);
