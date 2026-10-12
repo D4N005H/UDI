@@ -114,6 +114,12 @@ a ramp cannot run forever, so every update replays it.
 - `OnDeviceAdded` / `OnDeviceRemoved` fire again (they had been dead since the hook was removed in
   March 2025). They arrive on the thread that called `DIManager.Initialize`, which must pump Windows
   messages (Unity's main thread and the Explorer's UI thread do).
+- **Windows build target only.** Every assembly in this package and in its samples has the define
+  constraint `UNITY_STANDALONE_WIN`. When the active build target is anything else (Android, macOS,
+  Linux, consoles, WebGL, ...), Unity skips them entirely, in the Editor too. Nothing runs, there are
+  no notifications, and nothing is added to the build. Players are 64-bit Windows only (the DLL is x64).
+  Your own scripts that call `DIManager` must do the same, or they will not compile for other targets:
+  put them in an asmdef with the same constraint, or wrap the calls in `#if UNITY_STANDALONE_WIN`.
 
 ### Notifications (on-screen errors)
 

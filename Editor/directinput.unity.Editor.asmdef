@@ -12,7 +12,9 @@
     "overrideReferences": true,
     "precompiledReferences": [],
     "autoReferenced": true,
-    "defineConstraints": [],
+    "defineConstraints": [
+        "UNITY_STANDALONE_WIN"
+    ],
     "versionDefines": [],
     "noEngineReferences": false
 }
