@@ -46,7 +46,7 @@ namespace DirectInputExplorer
         private readonly ComboBox _devices = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, AccessibleName = "Device" };
         private readonly Button _refresh = new Button { Text = "Refresh list", AutoSize = true, AccessibleName = "Refresh device list" };
         private readonly Button _attach = new Button { Text = "Attach", AutoSize = true, Width = 90 };
-        private readonly CheckBox _autocenter = new CheckBox { Text = "Device autocenter spring", AutoSize = true, Checked = true, Enabled = false, Margin = new Padding(12, 6, 3, 3) };
+        private readonly CheckBox _autocenter = new CheckBox { Text = "Device autocenter spring", AutoSize = true, CheckState = CheckState.Indeterminate, Enabled = false, Margin = new Padding(12, 6, 3, 3) };
         private readonly Button _stopAll = new Button { Text = "STOP ALL FORCES  (Esc)", AutoSize = true, BackColor = Color.Firebrick, ForeColor = Color.White, FlatStyle = FlatStyle.Flat, Font = new Font(FontFamily.GenericSansSerif, 10f, FontStyle.Bold), Margin = new Padding(12, 0, 0, 0), AccessibleName = "Stop all forces" };
         private readonly Label _state = new Label { AutoSize = true, Text = "No device attached.", Margin = new Padding(3, 6, 3, 3) };
         private readonly TabControl _tabs = new TabControl { Dock = DockStyle.Fill };
@@ -64,6 +64,9 @@ namespace DirectInputExplorer
         private ActiveDeviceInfo _attachedAdi;
         private bool _enumerating;
         private bool _closing;
+        private bool _autocenterUpdating;
+        private string _inputError; // last input-read failure on the attached device; null while reads succeed
+        private readonly HashSet<Control> _statusLatched = new HashSet<Control>(); // panels whose error or hint the status timer must not overwrite
 
         public MainForm()
         {
@@ -71,8 +74,6 @@ namespace DirectInputExplorer
             MinimumSize = new Size(1000, 680);
             StartPosition = FormStartPosition.CenterScreen;
             AutoScaleMode = AutoScaleMode.Dpi;
-            KeyPreview = true;
-            KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) { StopAllForces("Escape pressed"); e.Handled = true; } };
 
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(8) };
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -115,13 +116,20 @@ namespace DirectInputExplorer
             _attach.Click += (s, e) => { if (_attached.HasValue) Detach(); else AttachSelected(); };
             _stopAll.Click += (s, e) => StopAllForces("STOP ALL pressed");
             _autocenter.CheckedChanged += (s, e) => SetAutocenter();
-            _poll.Tick += (s, e) => { if (_attached.HasValue) DIManager.Poll(_attached.Value); };
+            _poll.Tick += (s, e) => PollAttached();
             _statusRefresh.Tick += (s, e) => RefreshEffectStatuses();
             BuildInputRows();
             ResetEffectPanels("Attach a device first");
 
             Load += async (s, e) => await OnLoadAsync();
             FormClosing += OnClosing;
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            // Runs before any child control, so Escape stops forces even while a grid cell is being edited.
+            if ((keyData & Keys.KeyCode) == Keys.Escape) StopAllForces("Escape pressed");
+            return base.ProcessCmdKey(ref msg, keyData);
         }
 
         private static TabPage MakePage(string title, Control content)
@@ -141,7 +149,12 @@ namespace DirectInputExplorer
             var report = new Button { Text = "Device report (does not change forces)", AutoSize = true };
             report.Click += (s, e) => DeviceReport();
             var copy = new Button { Text = "Copy log", AutoSize = true };
-            copy.Click += (s, e) => { if (_log.Text.Length > 0) Clipboard.SetText(_log.Text); };
+            copy.Click += (s, e) =>
+            {
+                if (_log.Text.Length == 0) return;
+                try { Clipboard.SetText(_log.Text); }
+                catch (System.Runtime.InteropServices.ExternalException ex) { Log("Copy log failed (another program holds the clipboard): " + ex.Message); }
+            };
             var clear = new Button { Text = "Clear log", AutoSize = true };
             clear.Click += (s, e) => _log.Clear();
             buttons.Controls.Add(report);
@@ -185,7 +198,7 @@ namespace DirectInputExplorer
             {
                 Detach();
             }
-            DIManager.StopDirectInput(); // stops and releases every effect and device the DLL still holds
+            if (DIManager.IsInitialized) DIManager.StopDirectInput(); // stops and releases everything the DLL holds; skipped when the DLL never loaded
         }
 
         //////////////////////////////////////////////////////////////
@@ -196,8 +209,9 @@ namespace DirectInputExplorer
         {
             if (_enumerating) return;
             _enumerating = true;
-            _refresh.Enabled = false;
+            _refresh.Enabled = _attach.Enabled = false;
             _poll.Stop(); // enumeration runs on a worker thread; keep the DLL single-threaded meanwhile
+            _statusRefresh.Stop(); // and its API lock is held for the whole enumeration, which would freeze the UI
             _state.Text = "Enumerating devices (a stuck driver can make this take up to a minute)...";
             try
             {
@@ -206,8 +220,9 @@ namespace DirectInputExplorer
             finally
             {
                 _enumerating = false;
-                _refresh.Enabled = true;
+                _refresh.Enabled = _attach.Enabled = true;
                 _poll.Start();
+                _statusRefresh.Start();
             }
             RebuildDeviceList();
             Log($"Enumerated {DIManager.Devices.Length} device(s).");
@@ -223,11 +238,11 @@ namespace DirectInputExplorer
             if (index < 0 && _devices.Items.Count > 0) index = 0;
             _devices.SelectedIndex = index;
 
+            UpdateStateLabel();
             if (_attached.HasValue && DIManager.Devices.All(d => d.guidInstance != _attached.Value.guidInstance))
             {
-                DeviceLost(_attached.Value);
+                DeviceLost(_attached.Value); // last, so its safety warning stays in the state bar
             }
-            UpdateStateLabel();
         }
 
         private DeviceInfo? SelectedDevice() => (_devices.SelectedItem as DeviceItem)?.Info;
@@ -245,8 +260,8 @@ namespace DirectInputExplorer
             if (_closing || IsDisposed) return;
             if (InvokeRequired) { BeginInvoke(new Action<DeviceInfo>(OnDeviceRemoved), device); return; }
             Log($"Device removed: {device.productName} {device.guidInstance}");
-            if (_attached.HasValue && _attached.Value.guidInstance == device.guidInstance) DeviceLost(device);
             RebuildDeviceList();
+            if (_attached.HasValue && _attached.Value.guidInstance == device.guidInstance) DeviceLost(device);
         }
 
         private void AttachSelected()
@@ -261,19 +276,30 @@ namespace DirectInputExplorer
                 return;
             }
             _attached = device;
+            _inputError = null;
             if (DIManager.GetADI(device, out _attachedAdi))
             {
                 _attachedAdi.OnDeviceStateChange -= OnDeviceState; // Attach on an attached device returns true; never subscribe twice
                 _attachedAdi.OnDeviceStateChange += OnDeviceState;
             }
             var caps = DIManager.GetDeviceCapabilities(device);
+            string capsError = DIManager.LastHResult < 0 ? DIManager.LastError : null; // a failed query returns zeros, which read as "no force feedback"
             bool ffb = caps.dwFlags.HasFlag(DwFlags.DIDC_FORCEFEEDBACK);
             _attach.Text = "Detach";
             _autocenter.Enabled = ffb;
-            _custom.ShowDevicePeriod(caps.dwFFSamplePeriod);
-            Log($"Attached {device.productName} (force feedback: {(ffb ? "yes" : "no")}, axes {caps.dwAxes}, buttons {caps.dwButtons}, POVs {caps.dwPOVs}).");
-            ApplyEffectAvailability(device, ffb);
-            FillInfo(device, caps);
+            ShowAutocenterUnknown(); // a new device object starts at the driver default, which is not read back
+            if (capsError != null)
+            {
+                Log($"Attached {device.productName}, but {capsError}");
+                ResetEffectPanels("Capabilities query failed: " + capsError);
+            }
+            else
+            {
+                _custom.ShowDevicePeriod(caps.dwFFSamplePeriod);
+                Log($"Attached {device.productName} (force feedback: {(ffb ? "yes" : "no")}, axes {caps.dwAxes}, buttons {caps.dwButtons}, POVs {caps.dwPOVs}).");
+                ApplyEffectAvailability(device, ffb);
+            }
+            FillInfo(device, caps, capsError);
             UpdateStateLabel();
         }
 
@@ -297,7 +323,8 @@ namespace DirectInputExplorer
 
         private void DeviceLost(DeviceInfo device)
         {
-            // DIManager destroys the native device right after raising this event; nothing to release here.
+            // A manual Refresh drops the device without DIManager destroying it; stop and release its effects (no-op if already destroyed).
+            if (!DIManager.Destroy(device)) Log($"Destroy reported: {DIManager.LastError}");
             if (_attachedAdi != null) _attachedAdi.OnDeviceStateChange -= OnDeviceState;
             _attachedAdi = null;
             _attached = null;
@@ -314,7 +341,9 @@ namespace DirectInputExplorer
             if (_attached.HasValue)
             {
                 var d = _attached.Value;
-                _state.Text = $"Attached: {d.productName}   instance {d.guidInstance}   (exclusive, background cooperative level)";
+                _state.Text = _inputError != null
+                    ? $"Attached: {d.productName}, but input read failed: {_inputError}"
+                    : $"Attached: {d.productName}   instance {d.guidInstance}   (exclusive, background cooperative level)";
             }
             else if (DIManager.Devices.Length == 0)
             {
@@ -328,9 +357,17 @@ namespace DirectInputExplorer
 
         private void SetAutocenter()
         {
-            if (!_attached.HasValue) return;
+            if (!_attached.HasValue || _autocenterUpdating) return;
             bool ok = DIManager.SetAutocenter(_attached.Value.guidInstance, _autocenter.Checked);
             Log(ok ? $"Autocenter {(_autocenter.Checked ? "on" : "off")}." : $"Autocenter change failed: {DIManager.LastError}");
+            if (!ok) ShowAutocenterUnknown(); // the DLL can fail after setting the property (reacquire), so neither state is known
+        }
+
+        private void ShowAutocenterUnknown()
+        {
+            _autocenterUpdating = true;
+            _autocenter.CheckState = CheckState.Indeterminate;
+            _autocenterUpdating = false;
         }
 
         //////////////////////////////////////////////////////////////
@@ -351,12 +388,13 @@ namespace DirectInputExplorer
                 return;
             }
             bool known = DIManager.TryGetSupportedFFBEffects(device.guidInstance, out uint mask);
+            string notCreated = known ? "Not created" : "Not created (support not verified: " + DIManager.LastError + ")";
             if (!known) Log("Effect support unknown: " + DIManager.LastError);
             foreach (var p in _effectPanels)
             {
                 bool supported = !known || (mask & (1u << (int)p.Descriptor.Type)) != 0;
                 p.SetAvailable(supported, "Device does not enumerate this effect type");
-                if (supported) p.ResetToDisabled(known ? "Not created" : "Not created (support not verified: old DLL build)");
+                if (supported) p.ResetToDisabled(notCreated);
             }
             bool customSupported = !known || (mask & (1u << (int)FFBEffects.CustomForce)) != 0;
             _custom.SetAvailable(customSupported, "Device does not enumerate GUID_CustomForce");
@@ -403,11 +441,10 @@ namespace DirectInputExplorer
                 ok = DIManager.UpdateConditionForceNative(guid, d.Type, panel["offset"], panel["posCoef"], panel["negCoef"], (uint)panel["posSat"], (uint)panel["negSat"], panel["deadband"]);
             else
                 return;
-            if (!ok)
-            {
-                panel.SetStatus("Update failed: " + DIManager.LastError, isError: true);
-                Log($"{d.Name}: update failed: {DIManager.LastError}");
-            }
+            if (ok) { _statusLatched.Remove(panel); return; }
+            _statusLatched.Add(panel);
+            panel.SetStatus("Update failed: " + DIManager.LastError, isError: true);
+            Log($"{d.Name}: update failed: {DIManager.LastError}");
         }
 
         private void CustomEnableToggled(object sender, bool enable)
@@ -423,6 +460,7 @@ namespace DirectInputExplorer
                     return;
                 }
                 _custom.SetStatus("Created with 10 zero samples; press Apply to download yours");
+                _statusLatched.Add(_custom);
                 Log("Custom force: created and started with zero samples.");
             }
             else
@@ -438,6 +476,7 @@ namespace DirectInputExplorer
             if (!_attached.HasValue || !_custom.IsEffectEnabled) return;
             int[] samples = _custom.Samples;
             bool ok = DIManager.UpdateCustomForceNative(_attached.Value.guidInstance, samples, _custom.SamplePeriod);
+            if (ok) _statusLatched.Remove(_custom); else _statusLatched.Add(_custom);
             _custom.SetStatus(ok ? $"Sent {samples.Length} samples, period {(_custom.SamplePeriod == 0 ? "device default" : _custom.SamplePeriod + " us")}" : "Update failed: " + DIManager.LastError, !ok);
             Log(ok ? $"Custom force: sent {samples.Length} samples." : "Custom force: update failed: " + DIManager.LastError);
         }
@@ -459,24 +498,35 @@ namespace DirectInputExplorer
             string guid = _attached.Value.guidInstance;
             foreach (var p in _effectPanels)
             {
-                if (!p.IsEffectEnabled) continue;
-                p.SetStatus(DescribeStatus(guid, p.Descriptor.Type));
+                if (!p.IsEffectEnabled || _statusLatched.Contains(p)) continue;
+                p.SetStatus(DescribeStatus(guid, p.Descriptor.Type, out bool failed), failed);
             }
-            if (_custom.IsEffectEnabled) _custom.SetStatus(DescribeStatus(guid, FFBEffects.CustomForce));
+            if (_custom.IsEffectEnabled && !_statusLatched.Contains(_custom)) _custom.SetStatus(DescribeStatus(guid, FFBEffects.CustomForce, out bool customFailed), customFailed);
         }
 
-        private static string DescribeStatus(string guid, FFBEffects type)
+        private static string DescribeStatus(string guid, FFBEffects type, out bool failed)
         {
-            if (DIManager.TryGetFFBEffectStatus(guid, type, out bool playing))
-                return playing ? "Playing (reported by DirectInput)" : "Created, not playing (reported by DirectInput)";
-            if (DIManager.LastHResult == unchecked((int)0x80004001))
-                return "Enabled; playing state unavailable with this DLL build";
-            return "Status query failed: " + DIManager.LastError;
+            failed = !DIManager.TryGetFFBEffectStatus(guid, type, out bool playing);
+            // LastError names an old DLL only when the export is missing; a driver's own E_NOTIMPL is shown as such.
+            if (failed) return "Enabled; status unavailable: " + DIManager.LastError;
+            return playing ? "Playing (reported by DirectInput)" : "Created, not playing (reported by DirectInput)";
         }
 
         //////////////////////////////////////////////////////////////
         // Input and info
         //////////////////////////////////////////////////////////////
+
+        private void PollAttached()
+        {
+            // Poll records no result for a device DIManager no longer holds, so LastHResult would be stale.
+            if (!_attached.HasValue || !DIManager.IsDeviceActive(_attached.Value.guidInstance)) return;
+            DIManager.Poll(_attached.Value);
+            string error = DIManager.LastHResult < 0 ? DIManager.LastError : null;
+            if ((error == null) == (_inputError == null)) return; // report transitions only, not every 20 ms tick
+            _inputError = error;
+            Log(error == null ? "Input reads recovered." : "Input read failed: " + error);
+            UpdateStateLabel();
+        }
 
         private void BuildInputRows()
         {
@@ -538,7 +588,7 @@ namespace DirectInputExplorer
             item.SubItems[2].Text = bits;
         }
 
-        private void FillInfo(DeviceInfo device, DIDEVCAPS caps)
+        private void FillInfo(DeviceInfo device, DIDEVCAPS caps, string capsError)
         {
             var sb = new StringBuilder();
             sb.AppendLine("Device");
@@ -550,15 +600,22 @@ namespace DirectInputExplorer
             sb.AppendLine($"  enumerated as FFB {device.FFBCapable}");
             sb.AppendLine();
             sb.AppendLine("Capabilities (DIDEVCAPS)");
-            sb.AppendLine($"  dwFlags          0x{(uint)caps.dwFlags:X8}  {caps.dwFlags}");
-            sb.AppendLine($"  dwAxes           {caps.dwAxes}");
-            sb.AppendLine($"  dwButtons        {caps.dwButtons}");
-            sb.AppendLine($"  dwPOVs           {caps.dwPOVs}");
-            sb.AppendLine($"  dwFFSamplePeriod {caps.dwFFSamplePeriod} us   (minimum time between force commands)");
-            sb.AppendLine($"  dwFFMinTimeRes   {caps.dwFFMinTimeResolution} us");
-            sb.AppendLine($"  firmware         {caps.dwFirmwareRevision}");
-            sb.AppendLine($"  hardware         {caps.dwHardwareRevision}");
-            sb.AppendLine($"  FF driver        {caps.dwFFDriverVersion}");
+            if (capsError != null)
+            {
+                sb.AppendLine("  query failed: " + capsError); // the struct is zeroed, not reported by the device
+            }
+            else
+            {
+                sb.AppendLine($"  dwFlags          0x{(uint)caps.dwFlags:X8}  {caps.dwFlags}");
+                sb.AppendLine($"  dwAxes           {caps.dwAxes}");
+                sb.AppendLine($"  dwButtons        {caps.dwButtons}");
+                sb.AppendLine($"  dwPOVs           {caps.dwPOVs}");
+                sb.AppendLine($"  dwFFSamplePeriod {caps.dwFFSamplePeriod} us   (minimum time between force commands)");
+                sb.AppendLine($"  dwFFMinTimeRes   {caps.dwFFMinTimeResolution} us");
+                sb.AppendLine($"  firmware         {caps.dwFirmwareRevision}");
+                sb.AppendLine($"  hardware         {caps.dwHardwareRevision}");
+                sb.AppendLine($"  FF driver        {caps.dwFFDriverVersion}");
+            }
             sb.AppendLine();
             sb.AppendLine("Force feedback effects enumerated by the driver");
             var names = DIManager.GetDeviceFFBCapabilities(device);

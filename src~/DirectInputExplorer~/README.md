@@ -27,34 +27,41 @@ dotnet build DirectInputExplorer.csproj -c Release -p:EnableWindowsTargeting=tru
 The build copies `Runtime/Plugins/DLL/DirectInputForceFeedback.dll` next to the exe. The managed
 layer calls exports that only exist in a DLL built from the current `src~/DirectInputForceFeedback~`
 sources (`GetFFBEffectStatus`, `GetSupportedFFBEffects`, the four-argument `UpdateRampForce`). With
-an older DLL the Explorer still starts; effect status shows "support not verified: old DLL build" and
-ramp duration is ignored. Rebuild the DLL with Visual Studio (x64, Release) first; its post-build step
-copies it into `Runtime/Plugins/DLL`.
+an older DLL the Explorer still starts; effect panels say the DLL predates the export ("support not
+verified", "status unavailable") and ramp duration is ignored. Rebuild the DLL with Visual Studio
+(x64, Release) first; its post-build step copies it into `Runtime/Plugins/DLL`.
 
 ## Layout
 
 The window is built in code (`MainForm.cs`, `EffectPanel.cs`, `CustomForcePanel.cs`); there is no
 designer file.
 
-- Top: device list, Refresh (runs enumeration on a worker thread with polling paused), Attach/Detach,
-  Autocenter, Device report, and a red STOP ALL button. Escape also triggers STOP ALL.
-- Left: live input state (axes in the 0..65535 DirectInput range, buttons, POV hats) and the device
-  capabilities reported by `GetDeviceCapabilities`.
-- Right, "Effects" tab: one panel per standard effect. The enable box creates the effect at zero force;
+- Top bar: device list, Refresh (runs enumeration on a worker thread with polling paused), Attach/Detach,
+  Autocenter, and a red STOP ALL button. Escape also triggers STOP ALL, even while a grid cell is being
+  edited. The autocenter box shows an unknown (filled) state after attach and after a failed change,
+  because the Explorer does not read the device's setting back. The line under the bar shows the attach
+  state, input-read failures and the disconnect warning.
+- "Info" tab: the device capabilities reported by `GetDeviceCapabilities` and the effects the driver
+  enumerates. "Input" tab: live input state (axes in the 0..65535 DirectInput range, buttons, POV hats).
+- "Effects" tab: one panel per standard effect. The enable box creates the effect at zero force;
   each parameter has a slider and a numeric box showing the DirectInput range and unit (magnitudes and
   coefficients -10000..10000, saturations and dead band 0..10000, periods and ramp duration in
-  microseconds). The status line only ever shows what the API returned. Panels for effect types the
-  device does not enumerate are greyed with the reason.
-- Right, "Custom force" tab: sample count, sample period, a grid of samples validated to
-  -10000..10000, and an explicit Apply button (or "send on every edit").
-- Bottom: a log of every call result with HRESULT text.
+  microseconds). The status line only ever shows what the API returned; an update error stays until the
+  next successful update of that effect. Panels for effect types the device does not enumerate are
+  greyed with the reason.
+- "Custom force" tab: sample count, sample period, a grid of samples validated to -10000..10000, and an
+  explicit Apply button (or "send on every edit").
+- "Diagnostics" tab: Device report (does not change forces), and a log of every call result with
+  HRESULT text.
 
 ## Safety
 
-- Nothing is sent to a device until you attach it and enable an effect yourself. Enabling creates the
-  effect with zero force; forces change only when you move a control or press Apply.
-- STOP ALL, Detach, device loss and closing the window stop and destroy every effect the DLL holds and
-  reset the panels.
+- Nothing is sent to a device until you attach it and enable an effect yourself. Enabling an effect
+  panel creates the effect with zero force, then applies the values the panel shows (zero force by
+  default; values you set earlier stay after STOP ALL). The custom force starts with zero samples. After
+  that, forces change only when you move a control or press Apply.
+- STOP ALL, Detach, device loss (including a Refresh that no longer lists the attached device) and
+  closing the window stop and destroy every effect the DLL holds and reset the panels.
 - A DirectInput gain or magnitude does not tell you the physical torque a wheelbase will produce.
   Software stop commands cannot guarantee a wheel stops if the driver, the USB link or the device
   itself fails; keep the wheelbase's own power or emergency stop within reach.
