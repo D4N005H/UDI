@@ -239,19 +239,26 @@ public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
     {
         if (isFullyDone)
             return;
-        isFullyDone = false;
         if (!DIManager.Initialize())                                                                          // Start DirectInput if it's not already
+            return;                                                                                           // DIManager reported why, with what to do
+        try
         {
-            Debug.LogWarning($"[DirectInputManager] DirectInput is unavailable: {DIManager.LastError}");
-            return;
-        }
-        DIManager.EnumerateDevices();                                                                         // Scan for available devices 
+#if UNITY_EDITOR
+            DIManager.EnumerateDevices(EditorApplication.isPlayingOrWillChangePlaymode);                      // Edit mode re-runs this on every script compile: device notes only for Play Mode
+#else
+            DIManager.EnumerateDevices();                                                                     // Scan for available devices
+#endif
                                                                                                               // await DIManager.EnumerateDevicesAsync();                                                           // Async allows to detect enumeration issues but causes issues with domain reloads as await yields and processes devices before layouts can be built
-        DIManager.OnDeviceAdded += DIDeviceAdded;                                                             // Register handler for when a device is attached
-        GenerateISLayouts();                                                                                  // Create InputSystem Layouts for the DI Devices
-        AddAllDIDevicesToIS();                                                                                // Create InputSystem Devices for the DI Devices
-        isFullyDone = true;
-        Debug.Assert(isFullyDone == true, "DirectInputDevice has NOT been Initiated therefore Direct Input Is NOT Ready!!");
+            DIManager.OnDeviceAdded -= DIDeviceAdded;                                                         // A failed earlier attempt may have registered it
+            DIManager.OnDeviceAdded += DIDeviceAdded;                                                         // Register handler for when a device is attached
+            GenerateISLayouts();                                                                              // Create InputSystem Layouts for the DI Devices
+            AddAllDIDevicesToIS();                                                                            // Create InputSystem Devices for the DI Devices
+            isFullyDone = true;
+        }
+        catch (Exception ex)                                                                                  // An exception here would escape a static constructor and disable this type
+        {
+            DirectInputLogger.Report(DirectInputNotificationSeverity.Error, "DirectInput devices could not be added to the Input System", ex.ToString());
+        }
     }
 
     public static void GenerateISLayouts()
@@ -266,14 +273,29 @@ public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
         }
     }
 
+    private ActiveDeviceInfo m_Adi;                                                                          // The DIManager entry this device listens to
+
     protected override void FinishSetup()
     {
-        if (DIManager.Attach(this.description.serial))
-        {                                                       // Doing this in FinishSetup allows events to be re-created on Domain reloads
-            DIManager.ActiveDevices[this.description.serial].OnDeviceRemoved += this.DIDeviceRemoved;       // Register a handler for when the device is removed
-            DIManager.ActiveDevices[this.description.serial].OnDeviceStateChange += this.DeviceStateChanged;    // Register a handler for when the device state changes
-        }
+        if (DIManager.Attach(this.description.serial) && DIManager.GetADI(this.description.serial, out ActiveDeviceInfo ADI))
+            Bind(ADI);                                                                                         // Doing this in FinishSetup allows events to be re-created on Domain reloads
         base.FinishSetup();
+    }
+
+    private void Bind(ActiveDeviceInfo ADI)
+    {
+        Unbind();
+        m_Adi = ADI;
+        ADI.OnDeviceRemoved += this.DIDeviceRemoved;                                                          // Register a handler for when the device is removed
+        ADI.OnDeviceStateChange += this.DeviceStateChanged;                                                   // Register a handler for when the device state changes
+    }
+
+    private void Unbind()
+    {
+        if (m_Adi == null) return;
+        m_Adi.OnDeviceRemoved -= this.DIDeviceRemoved;
+        m_Adi.OnDeviceStateChange -= this.DeviceStateChanged;
+        m_Adi = null;
     }
 
     public override void MakeCurrent()
@@ -286,21 +308,20 @@ public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
     {
         base.OnRemoved();
         if (Current == this) { Current = null; }
-        if (DIManager.ActiveDevices.TryGetValue(this.description.serial, out ActiveDeviceInfo ADI))            // The ActiveDeviceInfo outlives this InputDevice
-        {
-            ADI.OnDeviceRemoved -= this.DIDeviceRemoved;
-            ADI.OnDeviceStateChange -= this.DeviceStateChanged;
-        }
+        Unbind();                                                                                              // The ActiveDeviceInfo outlives this InputDevice
     }
 
     public void OnUpdate()
     {
+        // DIManager.Destroy followed by Attach makes a new ActiveDeviceInfo; follow it, or input freezes.
+        if (DIManager.GetADI(this.description.serial, out ActiveDeviceInfo ADI) && !ReferenceEquals(ADI, m_Adi))
+            Bind(ADI);
         DIManager.Poll(this.description.serial); // TODO: Make ASYNC 
     }
 
     public static bool AddDIDeviceToIS(DeviceInfo device)
     {
-        if (InputSystem.devices.OfType<DirectInputDevice>().Where(d => d.description.serial == device.guidInstance).Any()) { return true; } // Device already exists
+        if (InputSystem.devices.OfType<DirectInputDevice>().Where(d => d.description.serial == device.guidInstance).Any()) { return DIManager.Attach(device); } // Device already exists; OnUpdate binds it to a new attach
         if (DIManager.Attach(device))
         {                                                                        // Attach to DirectInput device, proceed if successfully connected
             try
@@ -313,9 +334,10 @@ public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
                     capabilities = $@"{{""FFBCapable"":{device.FFBCapable.ToString().ToLower()}}}",
                 });
             }
-            catch
+            catch (Exception ex)
             {
-                Debug.LogWarning($"While D-Input Manager can handle, the Unity's new Input System can not handle and add the {device.productName} into their list, probably that is not Direct Input and might be an X-Input device!\nTherefore, DInput Manager skips this input device.");
+                DirectInputLogger.Report(DirectInputNotificationSeverity.Warning, $"The Input System could not add {device.productName}",
+                    $"Device: {device.productName} {device.guidInstance}\n{ex.GetType().Name}: {ex.Message}\nDirectInput skips this device.");
                 DIManager.Destroy(device);
                 return false;
             }
@@ -326,27 +348,21 @@ public class DirectInputDevice : InputDevice, IInputUpdateCallbackReceiver
 
     public static void DIDeviceAdded(DeviceInfo device)
     {
-        Debug.Log($"<color=#9416f9>[DirectInputManager]</color> <color=#6affff>DIDeviceAdded: {device.productName} : {device.guidProduct}</color>");
         GenerateISLayouts();                                                                                   // Ensure a layout is ready for the new device
         AddDIDeviceToIS(device);                                                                               // Add device to IS
     }
 
     protected void DIDeviceRemoved(DeviceInfo device)
     {
-        Debug.Log($"<color=#9416f9>[DirectInputManager]</color> <color=#ff0000>DIDeviceRemoved: {device.productName} : {device.guidProduct}</color>");
         InputSystem.RemoveDevice(this);                                                                        // Remove device from InputSystem, DIManager handles destroying the device for us :)
     }
 
-    protected void DeviceStateChanged(DeviceInfo device, FlatJoyState2 state)
+    protected unsafe void DeviceStateChanged(DeviceInfo device, FlatJoyState2 state)
     {
-        // Convert FlatJoyState2 to FlatJoyState2State (The InputSystem Type)
-        GCHandle handle = GCHandle.Alloc(state, GCHandleType.Pinned);
-        FlatJoyState2State ISState = (FlatJoyState2State)Marshal.PtrToStructure(handle.AddrOfPinnedObject(), typeof(FlatJoyState2State));
-        handle.Free();
-
-        InputDevice ISDevice = InputSystem.devices.OfType<DirectInputDevice>().Where(d => d.description.serial == device.guidInstance).FirstOrDefault(); // "this" caused issues after domain reload
-        if (ISDevice != null)
-            InputSystem.QueueStateEvent(ISDevice, ISState);                                                      // Notify InputSystem with updated state
+        // Same field layout (Tests/Editor/AbiLayoutTests), so reinterpret instead of marshalling: no allocation per state change.
+        // OnRemoved unbinds a removed device, and RecreateDevice removes the old instance first, so "this" is the live device.
+        if (added)
+            InputSystem.QueueStateEvent(this, *(FlatJoyState2State*)&state);                                    // Notify InputSystem with updated state
     }
 
     private static void AddAllDIDevicesToIS()

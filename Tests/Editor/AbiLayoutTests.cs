@@ -42,6 +42,16 @@ namespace DirectInputManager.Editor.Tests
         }
 
         [Test]
+        public void FlatJoyState2State_matches_FlatJoyState2_for_the_pointer_reinterpret()
+        {
+            // DirectInputDevice.DeviceStateChanged reinterprets one as the other instead of marshalling.
+            Assert.AreEqual(Marshal.SizeOf<FlatJoyState2>(), Marshal.SizeOf<FlatJoyState2State>());
+            Assert.AreEqual(Marshal.OffsetOf<FlatJoyState2>(nameof(FlatJoyState2.lX)), Marshal.OffsetOf<FlatJoyState2State>(nameof(FlatJoyState2State.lX)));
+            Assert.AreEqual(Marshal.OffsetOf<FlatJoyState2>(nameof(FlatJoyState2.lFRz)), Marshal.OffsetOf<FlatJoyState2State>(nameof(FlatJoyState2State.lFRz)));
+            Assert.AreEqual(Marshal.OffsetOf<FlatJoyState2>(nameof(FlatJoyState2.rgdwPOV)), Marshal.OffsetOf<FlatJoyState2State>(nameof(FlatJoyState2State.rgdwPOV)));
+        }
+
+        [Test]
         public void FlatJoyState2_equality_is_field_exact()
         {
             var a = new FlatJoyState2 { lX = 1, lFRz = 65535 };

@@ -115,6 +115,40 @@ a ramp cannot run forever, so every update replays it.
   March 2025). They arrive on the thread that called `DIManager.Initialize`, which must pump Windows
   messages (Unity's main thread and the Explorer's UI thread do).
 
+### Notifications (on-screen errors)
+
+Problems are reported **on by default**: each report goes to the Unity Console once (as an error,
+warning or log entry, prefixed `[DirectInput]`) and, in Play Mode, to a card in the top-right corner of
+the Game view (`DirectInputLogger`, IMGUI: no extra packages, works with either input backend and any
+render pipeline). A card shows a title; **Show details** adds the operation, device name, GUID and
+VID:PID, the HRESULT with its name and meaning, the DLL's last error message when it has one, and what
+to do. **Copy** puts the text on the clipboard. Repeats merge into one card with a count. Cards fade
+after about 6 s (info), 12 s (warning) or 20 s (error) of real time, and stay while hovered or expanded.
+
+- Turn the cards off: `DirectInputLogger.Enabled = false;` (or the samples' `DIManager.showLogsRuntime`),
+  or define `DIRECTINPUT_DISABLE_TOASTS` in Player Settings > Scripting Define Symbols to compile the
+  drawing out. Console logging stays either way.
+- Report your own: `DirectInputLogger.Report(DirectInputNotificationSeverity.Warning, "title", "details")`
+  works from any thread.
+- Covered: the plugin failing to load (a non-Windows or Arm64 Editor, DLL missing, a missing
+  dependency such as the Visual C++ 2015-2022 x64 runtime or `dinput8.dll`, an older DLL than the
+  scripts), DirectInput failing to start, enumeration failing when the DLL reports it as a failure
+  (distinct from "no controller found"),
+  another program holding the device exclusively, a device lost, unplugged or reconnected, effect
+  create/update failures (device full, unsupported, incomplete, not exclusively acquired, playing, not
+  downloaded, invalid parameters), success codes that mean the force was not fully applied
+  (`DI_DOWNLOADSKIPPED`, `DI_TRUNCATED`, `DI_TRUNCATEDANDRESTARTED`), driver-defined (`0x800403xx`) and
+  HID (`0xC011xxxx`) codes. Per-frame calls report once per change of operation, device and result, and
+  once more when they work again. In the Editor, a plugin that cannot load is also reported in edit mode,
+  with the DLL as the Console context, plus a Scene/Game view notification.
+- Only a likely cause: a wheel that enumerates without force feedback gets a hint chosen by its USB
+  vendor ID (for example, Logitech: G HUB or Logitech Gaming Software not running; console or
+  compatibility mode). Vendor software requirements are not verified here, so treat it as a lead, not a
+  diagnosis.
+- Not detectable: DirectInput cannot see a force-feedback strength of 0 in the vendor's software, an
+  emergency stop, or a force-feedback off switch on the wheel. Calls succeed in those cases, so a quiet
+  notification area never means "force feedback is OK".
+
 ## Compatible Devices
 ### Note that all the devices that use Direct Input (from the old Logitech G wheels to the advanced Simucube ones) should work
 The community has tested and verified that these devices do indeed work. Albeit not all devices support all the FFB effects!
