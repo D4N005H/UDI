@@ -1,4 +1,5 @@
-# Native DirectInput (and ForceFeedback) Support for Unity
+# Unity DirectInput Force Feedback W/ Input Manager!
+#### Now you can manage your DInput devices natively in addition to FFB Support!
 
 #### Now you can manage your DInput devices natively, in addition to FFB Support!
 
