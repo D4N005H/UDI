@@ -233,6 +233,78 @@ These enhancements would enable support for devices with multiple force feedback
 - `docs/engineering-notes.md`: findings, design decisions, measurements, verification matrix and the
   remaining work; `docs/ledgers/`: the DirectInput, Unity and history source ledgers behind them.
 
+# Open work (for the next developer)
+
+Everything below is known and not done. Items 1 and 2 block a release. For background, see the
+"Still open" list in `docs/engineering-notes.md`. Rules for every item:
+- never start an effect automatically or push force into a wheel without a user action;
+- keep public APIs and asset GUIDs unless the item says otherwise;
+- after each change, run the checks in "Tests and engineering notes" above.
+
+1. **Rebuild the native DLL (release blocker).**
+   - **Problem:** `Runtime/Plugins/DLL/DirectInputForceFeedback.dll` is older than its source.
+     - It lacks the `GetFFBEffectStatus` and `GetSupportedFFBEffects` exports.
+     - It still needs the Visual C++ runtime.
+     - None of the native fixes reach users until it is rebuilt.
+   - **Steps:** on Windows with Visual Studio 2022, open `src~/DirectInputForceFeedback~/DirectInputForceFeedback.sln` and build **Release | x64**. The project now uses the static runtime (`/MT`). The post-build step copies the DLL into `Runtime/Plugins/DLL`; keep the existing `.meta` file.
+   - **Verify:** in a VS developer prompt:
+     - `dumpbin /exports` must list 32 exports, including the two above.
+     - `dumpbin /dependents` must list no `MSVCP140`, `VCRUNTIME140*` or `api-ms-win-crt-*`.
+   - **Then:** commit the DLL.
+
+2. **Test in Unity and on real hardware (release blocker).** Nothing has run in Unity, on Windows or on a wheel yet.
+   - **Notifications:** check that each card appears once and that details, Copy and Dismiss work. Trigger these cases:
+     - rename the DLL (file missing);
+     - run on a PC without the VC++ runtime, using the old DLL only;
+     - unplug the wheel during play;
+     - open a second program that holds the wheel;
+     - plug in a wheel whose vendor driver is not installed.
+   - **Force feedback:** check every effect in the Explorer and in the samples. Confirm that STOP ALL, Esc, closing the app, unplugging the wheel and pausing Unity all release the force.
+   - **Samples:** in a clean project, import each sample on its own, then all of them, then make a Windows player build.
+   - **Hardware-dependent fixes:** confirm the `Poll()`-before-read fix and the `DI_DOWNLOADSKIPPED`/`DI_TRUNCATED` handling on real wheels.
+
+3. **Sample files share asset GUIDs across packages.**
+   - **Which files:**
+     - `DIInputManager.cs` has the same GUID in all three `.unitypackage` files.
+     - `DIInputValueMonitor.cs`, `RuntimeFFBConfigUI.cs`, `RuntimeInputMappingUI.cs` and `directinput.asmref` share a GUID in the two 1.0.1 packages.
+     - The sample root, `Scripts` and `Scene` folders share a GUID in all three.
+   - **Problem:** importing a second sample may overwrite the first one's files. Not yet checked in Unity.
+   - **Fix:** give each package's colliding assets new GUIDs, and update every reference to the old GUIDs inside that package's scenes and prefabs (search the YAML for `guid:`).
+   - **Verify:** do the item 2 sample import test.
+
+4. **DLL and scripts can be from different versions.** `GetPluginVersion()` in the native code always returns 1 and the C# side never calls it.
+   - **Fix:**
+     - Bump the native value with every ABI change.
+     - P/Invoke `GetPluginVersion` from `DIManager.Initialize`.
+     - When it differs from the expected value, report one Error through `DirectInputLogger.Report`.
+     - Treat a missing export as "old DLL"; `DIDiagnostics` already has that wording.
+   - **Verify:** add a unit test in `src~/DirectInputManager.Tests~`.
+
+5. **A device scan blocks the game.** The native `EnumerateDevices` holds the DLL's lock for both `EnumDevices` passes, so a main-thread poll waits for the whole scan. Scans can take long on some systems; see `docs/ledgers/dinput-ledger.md` #42.
+   - **Fix:** run both passes outside `g_apiLock` into a local list, then take the lock only to swap it in and free the old strings.
+   - **Keep:** `-1` on failure, and the pointer contract (valid until the next call).
+
+6. **The "likely cause" hints for wheel vendors are unverified.** The vendor websites could not be reached when `DIDiagnostics.VendorHint` (in `Runtime/DirectInputManager.cs`) was written.
+   - **Check:** against the vendors' own documentation and real wheels: Logitech G HUB or LGS, Thrustmaster drivers, the Fanatec driver, Moza Pit House, and whether the base needs a PC mode.
+   - **Then:** correct the text. Keep it worded as likely causes.
+
+7. **Saved effect toggles in the Fundamental sample are cleared on load** (`RuntimeFFBConfigUI`). This is deliberate: restoring them would start effects at launch.
+   - If restoring is wanted, restore them as "armed" only, and start effects only after a user action.
+
+8. **The Explorer hides a failed device scan.**
+   - **Problem:** once the DLL is rebuilt (item 1), a failed scan keeps the old device list but still logs "Enumerated N device(s)". The failure only reaches `Debug.WriteLine`.
+   - **Fix:** show the failure in the Explorer log and status bar. `DIManager.EnumerateDevices` keeps the old list when the native call returns `-1`.
+
+9. **The NWH sample needs Input System 1.1 or later**, because NWH Vehicle Physics 2 does. The package declares 1.0.2. Either state this in the sample description or raise the dependency.
+
+10. **Smaller native items:**
+    - A device that can't be reacquired is retried with one `Acquire` call per API call every frame.
+    - If restarting effects fails during a poll, that effect stays stopped until the next reacquire.
+    - Fix both with a per-device back-off, and report through the existing once-per-state-change path.
+
+Behaviour note for users of the API: effect updates can now return the success codes 3, 4, 8 or 12, so
+`DIManager.LastHResult` may be positive after a success. Test `LastHResult >= 0` for success, not `== 0`.
+
 # Notice
 Occasionally, calls to EnumerateDevices will take orders of magnitude longer than usual to execute (up to 60 seconds). This is caused by a Windows bug attempting to load an absent hardware device. USB Audio DACs & Corsair keyboards are known to cause this issue. Try disconnecting and reconnecting the offending USB devices. For more information, see [this](https://stackoverflow.com/questions/10967795/directinput8-enumdevices-sometimes-painfully-slow) StackOverflow post about the issue from 2012. See issue [#1](https://github.com/MrTimcakes/Unity-DirectInput/issues/1) for more info.
 
